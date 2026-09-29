@@ -1,0 +1,2880 @@
+From d88f44bdbfae81d0d2210ae6d71cc63da912b0ff Mon Sep 17 00:00:00 2001
+From: claude <c@c>
+Date: Tue, 29 Sep 2026 11:32:46 +0300
+Subject: [PATCH 1/5] Phase A: additive migration (years, strategic goals,
+ activities, refs) + backfill
+
+---
+ app/Models/Objective.php                      |  11 +-
+ app/Models/Plan.php                           |   9 +-
+ app/Models/PlanningYear.php                   |  26 ++-
+ app/Models/Position.php                       |   9 +-
+ app/Models/Project.php                        |  18 ++-
+ app/Models/StrategicGoal.php                  |  44 +++++
+ app/Models/Task.php                           |   9 +-
+ app/Services/PlanCopier.php                   |   9 +-
+ app/Support/Refs.php                          |  96 +++++++++++
+ ...0100_phase1_years_goals_hierarchy_refs.php | 151 ++++++++++++++++++
+ database/seeders/BaseSeeder.php               |  14 +-
+ 11 files changed, 379 insertions(+), 17 deletions(-)
+ create mode 100644 app/Models/StrategicGoal.php
+ create mode 100644 app/Support/Refs.php
+ create mode 100644 database/migrations/2026_09_29_000100_phase1_years_goals_hierarchy_refs.php
+
+diff --git a/app/Models/Objective.php b/app/Models/Objective.php
+index e89d5e6..77dfad4 100644
+--- a/app/Models/Objective.php
++++ b/app/Models/Objective.php
+@@ -8,10 +8,19 @@
+ 
+ class Objective extends Model
+ {
+-    protected $fillable = ['plan_id', 'title', 'description', 'weight', 'sort'];
++    protected $fillable = ['ref', 'plan_id', 'strategic_goal_id', 'title', 'description', 'weight', 'sort'];
+ 
+     protected $casts = ['weight' => 'float'];
+ 
++    protected static function booted(): void
++    {
++        static::creating(function (self $o) {
++            $o->ref ??= \App\Support\Refs::objective($o);
++        });
++    }
++
++    public function strategicGoal(): BelongsTo { return $this->belongsTo(StrategicGoal::class); }
++
+     public function plan(): BelongsTo { return $this->belongsTo(Plan::class); }
+     public function indicators(): HasMany { return $this->hasMany(Indicator::class)->orderBy('sort')->orderBy('id'); }
+     public function projects(): HasMany { return $this->hasMany(Project::class); }
+diff --git a/app/Models/Plan.php b/app/Models/Plan.php
+index 20ff0b0..a798260 100644
+--- a/app/Models/Plan.php
++++ b/app/Models/Plan.php
+@@ -18,9 +18,16 @@ class Plan extends Model
+         'closed' => 'مغلقة',
+     ];
+ 
+-    protected $fillable = ['planning_year_id', 'position_id', 'owner_user_id', 'scope_description', 'overall_outcome',
++    protected $fillable = ['ref', 'planning_year_id', 'position_id', 'owner_user_id', 'scope_description', 'overall_outcome',
+         'risks', 'resources', 'status', 'current_version', 'copied_from_plan_id'];
+ 
++    protected static function booted(): void
++    {
++        static::creating(function (self $p) {
++            $p->ref ??= \App\Support\Refs::plan($p);
++        });
++    }
++
+     public function year(): BelongsTo { return $this->belongsTo(PlanningYear::class, 'planning_year_id'); }
+     public function position(): BelongsTo { return $this->belongsTo(Position::class); }
+     public function owner(): BelongsTo { return $this->belongsTo(User::class, 'owner_user_id'); }
+diff --git a/app/Models/PlanningYear.php b/app/Models/PlanningYear.php
+index 6b52fc2..65f153a 100644
+--- a/app/Models/PlanningYear.php
++++ b/app/Models/PlanningYear.php
+@@ -3,17 +3,41 @@
+ namespace App\Models;
+ 
+ use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
+ use Illuminate\Database\Eloquent\Relations\HasMany;
+ 
++/**
++ * سنة التخطيط. قيم الحالة المخزنة: draft (مسودة) | open (نشطة — القيمة الأصلية) | closed (مغلقة).
++ */
+ class PlanningYear extends Model
+ {
+-    protected $fillable = ['year', 'status', 'created_by'];
++    public const STATUSES = ['draft' => 'مسودة', 'open' => 'نشطة', 'closed' => 'مغلقة'];
++
++    protected $fillable = ['year', 'name', 'starts_on', 'ends_on', 'owner_user_id', 'plans_due_on', 'description', 'status', 'created_by', 'closed_at', 'closed_by'];
++
++    protected $casts = ['starts_on' => 'date', 'ends_on' => 'date', 'plans_due_on' => 'date', 'closed_at' => 'datetime'];
+ 
+     public function quarters(): HasMany { return $this->hasMany(Quarter::class)->orderBy('number'); }
+     public function plans(): HasMany { return $this->hasMany(Plan::class); }
++    public function owner(): BelongsTo { return $this->belongsTo(User::class, 'owner_user_id'); }
++    public function closer(): BelongsTo { return $this->belongsTo(User::class, 'closed_by'); }
+ 
+     public function quarter(int $n): ?Quarter
+     {
+         return $this->quarters->firstWhere('number', $n);
+     }
++
++    public function statusLabel(): string { return self::STATUSES[$this->status] ?? $this->status; }
++
++    public function isClosed(): bool { return $this->status === 'closed'; }
++
++    public function isDraft(): bool { return $this->status === 'draft'; }
++
++    public function displayName(): string { return $this->name ?: 'سنة التخطيط ' . $this->year; }
++
++    /** هل تجاوز اليوم موعد اعتماد الخطط؟ */
++    public function plansOverdue(): bool
++    {
++        return $this->plans_due_on && $this->plans_due_on->lt(now()->startOfDay());
++    }
+ }
+diff --git a/app/Models/Position.php b/app/Models/Position.php
+index 8ec20fd..1426498 100644
+--- a/app/Models/Position.php
++++ b/app/Models/Position.php
+@@ -16,10 +16,17 @@ class Position extends Model
+     public const MEDIA = 'pr_media';
+     public const ENGINEERING = 'engineering';
+ 
+-    protected $fillable = ['code', 'name', 'global_view', 'is_planning', 'is_president', 'sort'];
++    protected $fillable = ['code', 'ref_code', 'name', 'global_view', 'is_planning', 'is_president', 'sort'];
+ 
+     protected $casts = ['global_view' => 'boolean', 'is_planning' => 'boolean', 'is_president' => 'boolean'];
+ 
++    protected static function booted(): void
++    {
++        static::creating(function (self $p) {
++            $p->ref_code ??= strtoupper(substr(preg_replace('/[^a-z]/i', '', $p->code), 0, 3));
++        });
++    }
++
+     public function users(): BelongsToMany
+     {
+         return $this->belongsToMany(User::class, 'position_user')->withPivot(['is_primary', 'starts_on', 'ends_on']);
+diff --git a/app/Models/Project.php b/app/Models/Project.php
+index 0c4fd44..c17e92b 100644
+--- a/app/Models/Project.php
++++ b/app/Models/Project.php
+@@ -8,12 +8,26 @@
+ 
+ class Project extends Model
+ {
+-    protected $fillable = ['plan_id', 'objective_id', 'type', 'name', 'description', 'responsible', 'owner_user_id', 'starts_on', 'ends_on', 'resources'];
++    public const TYPES = ['initiative' => 'مبادرة', 'project' => 'مشروع', 'activity' => 'نشاط'];
++
++    protected $fillable = ['ref', 'plan_id', 'objective_id', 'parent_id', 'type', 'name', 'description', 'responsible', 'owner_user_id', 'starts_on', 'ends_on', 'resources'];
+ 
+     protected $casts = ['starts_on' => 'date', 'ends_on' => 'date'];
+ 
++    protected static function booted(): void
++    {
++        static::creating(function (self $p) {
++            $p->ref ??= \App\Support\Refs::project($p);
++        });
++    }
++
++    public function parent(): BelongsTo { return $this->belongsTo(self::class, 'parent_id'); }
++    public function activities(): HasMany { return $this->hasMany(self::class, 'parent_id')->orderBy('id'); }
++    public function owner(): BelongsTo { return $this->belongsTo(User::class, 'owner_user_id'); }
++    public function isActivity(): bool { return $this->type === 'activity'; }
++
+     public function plan(): BelongsTo { return $this->belongsTo(Plan::class); }
+     public function objective(): BelongsTo { return $this->belongsTo(Objective::class); }
+     public function tasks(): HasMany { return $this->hasMany(Task::class)->orderBy('quarter')->orderBy('id'); }
+-    public function typeLabel(): string { return $this->type === 'initiative' ? 'مبادرة' : 'مشروع'; }
++    public function typeLabel(): string { return self::TYPES[$this->type] ?? 'مشروع'; }
+ }
+diff --git a/app/Models/StrategicGoal.php b/app/Models/StrategicGoal.php
+new file mode 100644
+index 0000000..6cfb84b
+--- /dev/null
++++ b/app/Models/StrategicGoal.php
+@@ -0,0 +1,44 @@
++<?php
++
++namespace App\Models;
++
++use App\Support\Refs;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Database\Eloquent\Relations\HasMany;
++
++/** هدف استراتيجي للجمعية — مرجع مشترك تُربط به أهداف خطط المناصب */
++class StrategicGoal extends Model
++{
++    public const STATUSES = ['active' => 'فعّال', 'archived' => 'مؤرشف'];
++
++    protected $fillable = ['ref', 'title', 'description', 'from_year', 'to_year', 'status', 'sort', 'created_by'];
++
++    protected static function booted(): void
++    {
++        static::creating(function (self $g) {
++            $g->ref ??= Refs::strategicGoal();
++        });
++    }
++
++    public function objectives(): HasMany { return $this->hasMany(Objective::class); }
++    public function creator(): BelongsTo { return $this->belongsTo(User::class, 'created_by'); }
++
++    public function statusLabel(): string { return self::STATUSES[$this->status] ?? $this->status; }
++
++    public function label(): string { return $this->ref . ' — ' . $this->title; }
++
++    /** هل ينطبق على سنة معيّنة؟ (فارغ = مفتوح) */
++    public function coversYear(int $year): bool
++    {
++        return (! $this->from_year || $this->from_year <= $year) && (! $this->to_year || $this->to_year >= $year);
++    }
++
++    public function scopeUsableFor($q, int $year)
++    {
++        return $q->where('status', 'active')
++            ->where(fn ($w) => $w->whereNull('from_year')->orWhere('from_year', '<=', $year))
++            ->where(fn ($w) => $w->whereNull('to_year')->orWhere('to_year', '>=', $year))
++            ->orderBy('sort')->orderBy('id');
++    }
++}
+diff --git a/app/Models/Task.php b/app/Models/Task.php
+index 621128d..6f99cf4 100644
+--- a/app/Models/Task.php
++++ b/app/Models/Task.php
+@@ -15,11 +15,18 @@ class Task extends Model
+         'done' => 'منجزة (معتمدة)',
+     ];
+ 
+-    protected $fillable = ['plan_id', 'project_id', 'title', 'description', 'responsible', 'owner_user_id', 'quarter',
++    protected $fillable = ['ref', 'plan_id', 'project_id', 'title', 'description', 'responsible', 'owner_user_id', 'quarter',
+         'original_quarter', 'due_on', 'required_evidence', 'status', 'completed_at'];
+ 
+     protected $casts = ['due_on' => 'date', 'completed_at' => 'datetime'];
+ 
++    protected static function booted(): void
++    {
++        static::creating(function (self $t) {
++            $t->ref ??= \App\Support\Refs::task($t);
++        });
++    }
++
+     public function plan(): BelongsTo { return $this->belongsTo(Plan::class); }
+     public function project(): BelongsTo { return $this->belongsTo(Project::class); }
+     public function owner(): BelongsTo { return $this->belongsTo(User::class, 'owner_user_id'); }
+diff --git a/app/Services/PlanCopier.php b/app/Services/PlanCopier.php
+index 8ddfb00..4f9ae2a 100644
+--- a/app/Services/PlanCopier.php
++++ b/app/Services/PlanCopier.php
+@@ -10,7 +10,8 @@
+ 
+ /**
+  * ينسخ هيكل خطة سنة سابقة إلى مسودة سنة جديدة:
+- * الأهداف والأوزان والمؤشرات ومستهدفاتها والمشاريع والمهام والمخاطر والموارد.
++ * الأهداف والأوزان وربطها بالأهداف الاستراتيجية والمؤشرات ومستهدفاتها والمبادرات وأنشطتها والمهام والمخاطر والموارد.
++ * تُولَّد أرقام مرجعية جديدة للسنة الجديدة.
+  * لا يُنسخ الإنجاز ولا الأدلة ولا الاعتمادات ولا حالة الخطة.
+  */
+ class PlanCopier
+@@ -34,7 +35,7 @@ public function copy(Plan $source, PlanningYear $target, User $by): Plan
+             ]);
+             $objMap = [];
+             foreach ($source->objectives as $o) {
+-                $no = $plan->objectives()->create($o->only(['title', 'description', 'weight', 'sort']));
++                $no = $plan->objectives()->create($o->only(['title', 'description', 'weight', 'sort', 'strategic_goal_id']));
+                 $objMap[$o->id] = $no->id;
+                 foreach ($o->indicators as $i) {
+                     $ni = $no->indicators()->create(['plan_id' => $plan->id] + $i->only([
+@@ -47,9 +48,11 @@ public function copy(Plan $source, PlanningYear $target, User $by): Plan
+                 }
+             }
+             $projMap = [];
+-            foreach ($source->projects as $p) {
++            // المبادرات أولًا ثم أنشطتها حتى تُربط الأنشطة بالمبادرات الجديدة
++            foreach ($source->projects->sortBy(fn ($p) => [$p->parent_id ? 1 : 0, $p->id]) as $p) {
+                 $np = $plan->projects()->create([
+                     'objective_id' => $objMap[$p->objective_id] ?? null,
++                    'parent_id' => $p->parent_id ? ($projMap[$p->parent_id] ?? null) : null,
+                     'starts_on' => $p->starts_on?->copy()->addYears($shift),
+                     'ends_on' => $p->ends_on?->copy()->addYears($shift),
+                 ] + $p->only(['type', 'name', 'description', 'responsible', 'owner_user_id', 'resources']));
+diff --git a/app/Support/Refs.php b/app/Support/Refs.php
+new file mode 100644
+index 0000000..50b70f3
+--- /dev/null
++++ b/app/Support/Refs.php
+@@ -0,0 +1,96 @@
++<?php
++
++namespace App\Support;
++
++use App\Models\Objective;
++use App\Models\Plan;
++use App\Models\Project;
++use App\Models\StrategicGoal;
++use App\Models\Task;
++use Illuminate\Support\Facades\DB;
++
++/**
++ * الترقيم المرجعي الثابت. يُعيَّن مرة واحدة عند الإنشاء ولا يتغير بعدها ولا يُعاد استخدامه:
++ *   الهدف الاستراتيجي  SG-01
++ *   الخطة              PL-2026-ENG
++ *   هدف الخطة          PL-2026-ENG-O1
++ *   المبادرة/المشروع    PL-2026-ENG-I01 / PL-2026-ENG-P01
++ *   النشاط             PL-2026-ENG-I01-A01
++ *   المهمة             PL-2026-ENG-T001
++ */
++class Refs
++{
++    /** الرقم التالي = أكبر من (آخر رقم مسجّل للبادئة) و(أكبر رقم موجود فعلًا) + 1؛ لا يُعاد استخدام رقم محذوف */
++    private static function next(string $table, string $prefix, int $pad, ?callable $scope = null): string
++    {
++        // لا نعتمد على تهريب LIKE (يختلف بين SQLite و MySQL): نوسّع البحث ثم نتحقق من البادئة حرفيًا
++        $q = DB::table($table)->where('ref', 'like', $prefix . '%');
++        if ($scope) {
++            $scope($q);
++        }
++        $max = 0;
++        foreach ($q->pluck('ref') as $ref) {
++            if (! str_starts_with($ref, $prefix)) {
++                continue;
++            }
++            $tail = substr($ref, strlen($prefix));
++            if (ctype_digit($tail)) {
++                $max = max($max, (int) $tail);
++            }
++        }
++
++        $seq = DB::table('ref_sequences')->where('prefix', $prefix)->lockForUpdate()->value('last') ?? 0;
++        $n = max($max, (int) $seq) + 1;
++        DB::table('ref_sequences')->updateOrInsert(['prefix' => $prefix], ['last' => $n, 'updated_at' => now(), 'created_at' => now()]);
++
++        return $prefix . str_pad((string) $n, $pad, '0', STR_PAD_LEFT);
++    }
++
++    public static function strategicGoal(): string
++    {
++        return self::next('strategic_goals', 'SG-', 2);
++    }
++
++    public static function plan(Plan $p): string
++    {
++        $year = $p->year ?? \App\Models\PlanningYear::find($p->planning_year_id);
++        $pos = $p->position ?? \App\Models\Position::find($p->position_id);
++        $ref = 'PL-' . $year->year . '-' . ($pos->ref_code ?: strtoupper($pos->code));
++
++        return DB::table('plans')->where('ref', $ref)->exists() ? $ref . '-' . uniqid() : $ref;
++    }
++
++    private static function planRef(int $planId): string
++    {
++        $ref = Plan::whereKey($planId)->value('ref');
++        if (! $ref) {
++            $plan = Plan::findOrFail($planId);
++            $plan->ref = self::plan($plan);
++            $plan->saveQuietly();
++            $ref = $plan->ref;
++        }
++
++        return $ref;
++    }
++
++    public static function objective(Objective $o): string
++    {
++        return self::next('objectives', self::planRef($o->plan_id) . '-O', 1);
++    }
++
++    public static function project(Project $p): string
++    {
++        if ($p->parent_id) {
++            $parentRef = Project::whereKey($p->parent_id)->value('ref');
++
++            return self::next('projects', $parentRef . '-A', 2);
++        }
++
++        return self::next('projects', self::planRef($p->plan_id) . '-' . ($p->type === 'project' ? 'P' : 'I'), 2);
++    }
++
++    public static function task(Task $t): string
++    {
++        return self::next('tasks', self::planRef($t->plan_id) . '-T', 3);
++    }
++}
+diff --git a/database/migrations/2026_09_29_000100_phase1_years_goals_hierarchy_refs.php b/database/migrations/2026_09_29_000100_phase1_years_goals_hierarchy_refs.php
+new file mode 100644
+index 0000000..b95d7ed
+--- /dev/null
++++ b/database/migrations/2026_09_29_000100_phase1_years_goals_hierarchy_refs.php
+@@ -0,0 +1,151 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Schema;
++
++/**
++ * المرحلة الأولى من التطوير — تغييرات إضافية فقط:
++ * - بيانات إدارة سنة التخطيط (اسم، تواريخ، مسؤول، موعد اعتماد الخطط، حالة مسودة/نشطة/مغلقة).
++ * - جدول الأهداف الاستراتيجية للجمعية وربط أهداف الخطط بها.
++ * - مستوى «النشاط» تحت المبادرة (projects.parent_id).
++ * - ترقيم مرجعي ثابت (ref) للخطط والأهداف والمبادرات والأنشطة والمهام، ورمز مختصر لكل منصب.
++ *
++ * لا يُحذف أي عمود أو سجل، ولا تُغيَّر أي قيمة قائمة سوى تعبئة الأعمدة الجديدة الفارغة.
++ * قيمة حالة السنة الحالية 'open' تبقى كما هي وتعني «نشطة».
++ */
++return new class extends Migration
++{
++    private const POSITION_CODES = [
++        'president' => 'PRS', 'vice_president' => 'VPR', 'secretary' => 'SEC', 'finance_admin' => 'FIN',
++        'planning' => 'PLN', 'pr_media' => 'MED', 'engineering' => 'ENG',
++    ];
++
++    public function up(): void
++    {
++        Schema::table('positions', function (Blueprint $t) {
++            $t->string('ref_code', 8)->nullable()->after('code');
++        });
++
++        Schema::table('planning_years', function (Blueprint $t) {
++            $t->string('name')->nullable()->after('year');
++            $t->date('starts_on')->nullable()->after('name');
++            $t->date('ends_on')->nullable()->after('starts_on');
++            $t->foreignId('owner_user_id')->nullable()->after('ends_on')->constrained('users')->nullOnDelete();
++            $t->date('plans_due_on')->nullable()->after('owner_user_id');
++            $t->text('description')->nullable()->after('plans_due_on');
++            $t->timestamp('closed_at')->nullable();
++            $t->foreignId('closed_by')->nullable()->constrained('users')->nullOnDelete();
++        });
++
++        Schema::create('strategic_goals', function (Blueprint $t) {
++            $t->id();
++            $t->string('ref', 20)->unique();
++            $t->string('title');
++            $t->text('description')->nullable();
++            $t->unsignedSmallInteger('from_year')->nullable();
++            $t->unsignedSmallInteger('to_year')->nullable();
++            $t->string('status')->default('active'); // active | archived
++            $t->unsignedSmallInteger('sort')->default(0);
++            $t->foreignId('created_by')->nullable()->constrained('users')->nullOnDelete();
++            $t->timestamps();
++        });
++
++        // آخر رقم مستخدم لكل بادئة، حتى لا يُعاد استخدام رقم عنصر محذوف
++        Schema::create('ref_sequences', function (Blueprint $t) {
++            $t->string('prefix', 60)->primary();
++            $t->unsignedInteger('last')->default(0);
++            $t->timestamps();
++        });
++
++        Schema::table('plans', function (Blueprint $t) {
++            $t->string('ref', 40)->nullable()->unique()->after('id');
++        });
++        Schema::table('objectives', function (Blueprint $t) {
++            $t->string('ref', 50)->nullable()->unique()->after('id');
++            $t->foreignId('strategic_goal_id')->nullable()->after('plan_id')->constrained('strategic_goals')->nullOnDelete();
++        });
++        Schema::table('projects', function (Blueprint $t) {
++            $t->string('ref', 60)->nullable()->unique()->after('id');
++            $t->foreignId('parent_id')->nullable()->after('objective_id')->constrained('projects')->nullOnDelete();
++        });
++        Schema::table('tasks', function (Blueprint $t) {
++            $t->string('ref', 60)->nullable()->unique()->after('id');
++        });
++
++        $this->backfill();
++    }
++
++    /** تعبئة الأعمدة الجديدة للسجلات القائمة فقط (الأعمدة الفارغة)، بترتيب الإنشاء */
++    private function backfill(): void
++    {
++        foreach (DB::table('positions')->whereNull('ref_code')->get() as $p) {
++            DB::table('positions')->where('id', $p->id)->update(['ref_code' => self::POSITION_CODES[$p->code] ?? strtoupper(substr(preg_replace('/[^a-z]/i', '', $p->code), 0, 3)) . $p->id]);
++        }
++
++        foreach (DB::table('planning_years')->get() as $y) {
++            $q = DB::table('quarters')->where('planning_year_id', $y->id);
++            DB::table('planning_years')->where('id', $y->id)->update([
++                'name' => $y->name ?? ('سنة التخطيط ' . $y->year),
++                'starts_on' => $y->starts_on ?? ($q->min('starts_on') ?? $y->year . '-01-01'),
++                'ends_on' => $y->ends_on ?? ((clone $q)->max('ends_on') ?? $y->year . '-12-31'),
++            ]);
++        }
++
++        $codes = DB::table('positions')->pluck('ref_code', 'id');
++        $years = DB::table('planning_years')->pluck('year', 'id');
++        foreach (DB::table('plans')->whereNull('ref')->orderBy('id')->get() as $plan) {
++            $planRef = 'PL-' . $years[$plan->planning_year_id] . '-' . $codes[$plan->position_id];
++            if (DB::table('plans')->where('ref', $planRef)->exists()) {
++                $planRef .= '-' . $plan->id;
++            }
++            DB::table('plans')->where('id', $plan->id)->update(['ref' => $planRef]);
++
++            $n = 0;
++            foreach (DB::table('objectives')->where('plan_id', $plan->id)->orderBy('sort')->orderBy('id')->get() as $o) {
++                DB::table('objectives')->where('id', $o->id)->update(['ref' => $planRef . '-O' . (++$n)]);
++            }
++            $n = 0;
++            foreach (DB::table('projects')->where('plan_id', $plan->id)->whereNull('parent_id')->orderBy('id')->get() as $p) {
++                DB::table('projects')->where('id', $p->id)->update(['ref' => $planRef . '-' . ($p->type === 'project' ? 'P' : 'I') . str_pad((string) (++$n), 2, '0', STR_PAD_LEFT)]);
++            }
++            $n = 0;
++            foreach (DB::table('tasks')->where('plan_id', $plan->id)->orderBy('id')->get() as $t) {
++                DB::table('tasks')->where('id', $t->id)->update(['ref' => $planRef . '-T' . str_pad((string) (++$n), 3, '0', STR_PAD_LEFT)]);
++            }
++        }
++    }
++
++    public function down(): void
++    {
++        Schema::table('tasks', function (Blueprint $t) {
++            $t->dropUnique(['ref']);
++            $t->dropColumn('ref');
++        });
++        Schema::table('projects', function (Blueprint $t) {
++            $t->dropForeign(['parent_id']);
++            $t->dropUnique(['ref']);
++            $t->dropColumn(['ref', 'parent_id']);
++        });
++        Schema::table('objectives', function (Blueprint $t) {
++            $t->dropForeign(['strategic_goal_id']);
++            $t->dropUnique(['ref']);
++            $t->dropColumn(['ref', 'strategic_goal_id']);
++        });
++        Schema::table('plans', function (Blueprint $t) {
++            $t->dropUnique(['ref']);
++            $t->dropColumn('ref');
++        });
++        Schema::dropIfExists('strategic_goals');
++        Schema::dropIfExists('ref_sequences');
++        Schema::table('planning_years', function (Blueprint $t) {
++            $t->dropForeign(['owner_user_id']);
++            $t->dropForeign(['closed_by']);
++            $t->dropColumn(['name', 'starts_on', 'ends_on', 'owner_user_id', 'plans_due_on', 'description', 'closed_at', 'closed_by']);
++        });
++        Schema::table('positions', function (Blueprint $t) {
++            $t->dropColumn('ref_code');
++        });
++    }
++};
+diff --git a/database/seeders/BaseSeeder.php b/database/seeders/BaseSeeder.php
+index f55d40d..78211b3 100644
+--- a/database/seeders/BaseSeeder.php
++++ b/database/seeders/BaseSeeder.php
+@@ -10,13 +10,13 @@
+ class BaseSeeder extends Seeder
+ {
+     public const POSITIONS = [
+-        ['code' => Position::PRESIDENT, 'name' => 'الرئيس', 'global_view' => true, 'is_president' => true],
+-        ['code' => Position::VICE_PRESIDENT, 'name' => 'نائب الرئيس'],
+-        ['code' => Position::SECRETARY, 'name' => 'أمين السر'],
+-        ['code' => Position::FINANCE, 'name' => 'مسؤول الشؤون المالية والإدارية'],
+-        ['code' => Position::PLANNING, 'name' => 'مسؤول التخطيط والمتابعة', 'global_view' => true, 'is_planning' => true],
+-        ['code' => Position::MEDIA, 'name' => 'مسؤول العلاقات العامة والإعلام'],
+-        ['code' => Position::ENGINEERING, 'name' => 'مسؤول الشؤون الهندسية'],
++        ['code' => Position::PRESIDENT, 'ref_code' => 'PRS', 'name' => 'الرئيس', 'global_view' => true, 'is_president' => true],
++        ['code' => Position::VICE_PRESIDENT, 'ref_code' => 'VPR', 'name' => 'نائب الرئيس'],
++        ['code' => Position::SECRETARY, 'ref_code' => 'SEC', 'name' => 'أمين السر'],
++        ['code' => Position::FINANCE, 'ref_code' => 'FIN', 'name' => 'مسؤول الشؤون المالية والإدارية'],
++        ['code' => Position::PLANNING, 'ref_code' => 'PLN', 'name' => 'مسؤول التخطيط والمتابعة', 'global_view' => true, 'is_planning' => true],
++        ['code' => Position::MEDIA, 'ref_code' => 'MED', 'name' => 'مسؤول العلاقات العامة والإعلام'],
++        ['code' => Position::ENGINEERING, 'ref_code' => 'ENG', 'name' => 'مسؤول الشؤون الهندسية'],
+     ];
+ 
+     public function run(): void
+-- 
+2.43.0
+
+
+From 07a9d2079db2ac03f7df725256f00611398b105b Mon Sep 17 00:00:00 2001
+From: claude <c@c>
+Date: Tue, 29 Sep 2026 11:35:27 +0300
+Subject: [PATCH 2/5] Phase B: planning year management (details, lifecycle,
+ audit)
+
+---
+ app/Http/Controllers/PlanController.php |   2 +
+ app/Http/Controllers/YearController.php |  55 +++++++++-
+ app/Services/YearService.php            | 139 ++++++++++++++++++++++--
+ resources/views/years/edit.blade.php    |  90 +++++++++++++++
+ resources/views/years/index.blade.php   |  40 ++++++-
+ routes/web.php                          |   3 +
+ tests/Feature/YearManagementTest.php    | 134 +++++++++++++++++++++++
+ 7 files changed, 445 insertions(+), 18 deletions(-)
+ create mode 100644 resources/views/years/edit.blade.php
+ create mode 100644 tests/Feature/YearManagementTest.php
+
+diff --git a/app/Http/Controllers/PlanController.php b/app/Http/Controllers/PlanController.php
+index 24b9caf..700ac3e 100644
+--- a/app/Http/Controllers/PlanController.php
++++ b/app/Http/Controllers/PlanController.php
+@@ -34,6 +34,7 @@ public function store(Request $request)
+         $u = $request->user();
+         $data = $request->validate(['position_id' => 'required|exists:positions,id', 'planning_year_id' => 'required|exists:planning_years,id']);
+         abort_unless(Access::holdsPosition($u, (int) $data['position_id']), 403, 'إنشاء الخطة متاح لصاحب المنصب فقط.');
++        abort_if(PlanningYear::find($data['planning_year_id'])->isClosed(), 422, 'السنة مغلقة ولا تقبل خططًا جديدة.');
+         $existing = Plan::where($data)->first();
+         if ($existing) {
+             return redirect()->route('plans.show', $existing);
+@@ -51,6 +52,7 @@ public function copy(Request $request, Plan $plan)
+         abort_unless(Access::isPlanOwner($u, $plan), 403);
+         $target = PlanningYear::findOrFail($request->integer('planning_year_id'));
+         abort_if($target->year <= $plan->year->year, 422, 'اختر سنة لاحقة لسنة الخطة المصدر.');
++        abort_if($target->isClosed(), 422, 'السنة الهدف مغلقة.');
+         if ($ex = Plan::where('planning_year_id', $target->id)->where('position_id', $plan->position_id)->first()) {
+             return redirect()->route('plans.show', $ex)->withErrors(['copy' => 'توجد خطة لهذا المنصب في سنة ' . $target->year . ' مسبقًا.']);
+         }
+diff --git a/app/Http/Controllers/YearController.php b/app/Http/Controllers/YearController.php
+index 57facdd..a55f21c 100644
+--- a/app/Http/Controllers/YearController.php
++++ b/app/Http/Controllers/YearController.php
+@@ -16,20 +16,65 @@ public function index()
+     {
+         $u = auth()->user();
+         abort_unless(Access::canManageYears($u) || Access::hasGlobalView($u), 403);
+-        $years = PlanningYear::with(['quarters' => fn ($q) => $q->orderBy('number'), 'plans.position'])->orderByDesc('year')->get();
++        $years = PlanningYear::with(['quarters' => fn ($q) => $q->orderBy('number'), 'plans.position', 'owner'])->orderByDesc('year')->get();
+         $rules = StatusRule::orderByDesc('version')->get();
++        $users = \App\Models\User::where('is_active', true)->orderBy('name')->get(['id', 'name']);
+ 
+-        return view('years.index', compact('years', 'rules'));
++        return view('years.index', compact('years', 'rules', 'users'));
++    }
++
++    private const LABELS = ['year' => 'السنة', 'name' => 'اسم السنة', 'starts_on' => 'تاريخ البداية', 'ends_on' => 'تاريخ النهاية',
++        'owner_user_id' => 'المسؤول', 'plans_due_on' => 'موعد اعتماد الخطط', 'description' => 'الوصف', 'status' => 'الحالة'];
++
++    private function yearRules(): array
++    {
++        return [
++            'name' => 'required|string|max:150',
++            'starts_on' => 'required|date',
++            'ends_on' => 'required|date|after:starts_on',
++            'owner_user_id' => 'nullable|exists:users,id',
++            'plans_due_on' => 'nullable|date',
++            'description' => 'nullable|string|max:3000',
++        ];
+     }
+ 
+     public function store(Request $r)
+     {
+         abort_unless(Access::canManageYears($r->user()), 403);
+-        $d = $r->validate(['year' => 'required|integer|min:2020|max:2100|unique:planning_years,year'], ['year.unique' => 'هذه السنة موجودة مسبقًا.'], ['year' => 'السنة']);
+-        $y = app(YearService::class)->create((int) $d['year'], $r->user());
++        $d = $r->validate(['year' => 'required|integer|min:2020|max:2100|unique:planning_years,year', 'status' => 'required|in:draft,open'] + $this->yearRules(),
++            ['year.unique' => 'هذه السنة موجودة مسبقًا.'], self::LABELS);
++        $y = app(YearService::class)->create((int) $d['year'], $r->user(), $d);
+         session(['year_id' => $y->id, 'quarter' => 1]);
+ 
+-        return back()->with('ok', 'أُنشئت سنة ' . $y->year . ' بأرباعها الأربعة. يستطيع كل مسؤول الآن إنشاء خطته أو نسخ هيكل خطته السابقة.');
++        return redirect()->route('years.index')->with('ok', 'أُنشئت «' . $y->displayName() . '» بأرباعها الأربعة (' . $y->statusLabel() . '). يستطيع كل مسؤول الآن إنشاء خطته أو نسخ هيكل خطته السابقة.');
++    }
++
++    public function edit(PlanningYear $year)
++    {
++        abort_unless(Access::canManageYears(auth()->user()), 403);
++        $year->load(['quarters', 'owner', 'closer']);
++        $users = \App\Models\User::where('is_active', true)->orderBy('name')->get(['id', 'name']);
++        $history = \App\Models\AuditLog::where('entity_type', 'PlanningYear')->where('entity_id', $year->id)->with('user')->latest('id')->get();
++
++        return view('years.edit', compact('year', 'users', 'history'));
++    }
++
++    public function update(Request $r, PlanningYear $year)
++    {
++        abort_unless(Access::canManageYears($r->user()), 403);
++        $d = $r->validate($this->yearRules(), [], self::LABELS);
++        app(YearService::class)->update($year, $r->user(), $d);
++
++        return redirect()->route('years.edit', $year)->with('ok', 'حُفظت بيانات السنة.');
++    }
++
++    public function transition(Request $r, PlanningYear $year, string $action)
++    {
++        abort_unless(Access::canManageYears($r->user()), 403);
++        $d = $r->validate(['reason' => 'nullable|string|max:2000'], [], ['reason' => 'السبب']);
++        app(YearService::class)->transition($year, $r->user(), $action, $d['reason'] ?? null);
++
++        return back()->with('ok', YearService::TRANSITIONS[$action]['label'] . ': تم. الحالة الآن «' . $year->statusLabel() . '».');
+     }
+ 
+     public function closeQuarter(Request $r, PlanningYear $year, int $number)
+diff --git a/app/Services/YearService.php b/app/Services/YearService.php
+index b146676..8bc4540 100644
+--- a/app/Services/YearService.php
++++ b/app/Services/YearService.php
+@@ -7,19 +7,142 @@
+ use App\Support\Audit;
+ use Illuminate\Support\Carbon;
+ use Illuminate\Support\Facades\DB;
++use Illuminate\Validation\ValidationException;
+ 
++/**
++ * إدارة سنوات التخطيط: الإنشاء بأرباعها الأربعة، تعديل البيانات، والتفعيل والإغلاق وإعادة الفتح بسبب موثق.
++ * حالات السنة: draft (مسودة) → open (نشطة) → closed (مغلقة)، وإعادة الفتح closed → open بسبب مسجل.
++ */
+ class YearService
+ {
+-    /** ينشئ سنة تخطيط بأرباعها الأربعة */
+-    public function create(int $year, User $by): PlanningYear
++    public const EDITABLE = ['name', 'owner_user_id', 'plans_due_on', 'description'];
++
++    /**
++     * ينشئ سنة تخطيط بأرباعها الأربعة.
++     * التوقيع متوافق مع الاستدعاءات السابقة: create(2027, $user) ينشئ سنة ميلادية كاملة نشطة كما كان.
++     */
++    public function create(int $year, User $by, array $data = []): PlanningYear
+     {
+-        return DB::transaction(function () use ($year, $by) {
+-            $y = PlanningYear::create(['year' => $year, 'status' => 'open', 'created_by' => $by->id]);
+-            for ($q = 1; $q <= 4; $q++) {
+-                $start = Carbon::create($year, ($q - 1) * 3 + 1, 1);
+-                $y->quarters()->create(['number' => $q, 'starts_on' => $start, 'ends_on' => $start->copy()->addMonths(3)->subDay(), 'status' => 'open']);
++        $start = Carbon::parse($data['starts_on'] ?? "$year-01-01")->startOfDay();
++        $end = Carbon::parse($data['ends_on'] ?? "$year-12-31")->startOfDay();
++        $this->assertSpan($start, $end);
++
++        return DB::transaction(function () use ($year, $by, $data, $start, $end) {
++            $y = PlanningYear::create([
++                'year' => $year,
++                'name' => $data['name'] ?? ('سنة التخطيط ' . $year),
++                'starts_on' => $start,
++                'ends_on' => $end,
++                'owner_user_id' => $data['owner_user_id'] ?? null,
++                'plans_due_on' => $data['plans_due_on'] ?? null,
++                'description' => $data['description'] ?? null,
++                'status' => $data['status'] ?? 'open',
++                'created_by' => $by->id,
++            ]);
++            foreach ($this->quarterRanges($start, $end) as $q => [$qs, $qe]) {
++                $y->quarters()->create(['number' => $q, 'starts_on' => $qs, 'ends_on' => $qe, 'status' => 'open']);
++            }
++            Audit::log('year.create', $y, null, $y->only(['year', 'name', 'status', 'owner_user_id', 'plans_due_on']) + [
++                'starts_on' => $start->toDateString(), 'ends_on' => $end->toDateString(),
++            ]);
++
++            return $y;
++        });
++    }
++
++    /** أربعة أرباع متتالية بثلاثة أشهر لكل ربع من تاريخ البداية، وينتهي الرابع بتاريخ نهاية السنة */
++    public function quarterRanges(Carbon $start, Carbon $end): array
++    {
++        $out = [];
++        for ($q = 1; $q <= 4; $q++) {
++            $qs = $start->copy()->addMonthsNoOverflow(3 * ($q - 1));
++            $qe = $q < 4 ? $start->copy()->addMonthsNoOverflow(3 * $q)->subDay() : $end->copy();
++            $out[$q] = [$qs, $qe];
++        }
++
++        return $out;
++    }
++
++    private function assertSpan(Carbon $start, Carbon $end): void
++    {
++        if ($end->lte($start)) {
++            throw ValidationException::withMessages(['ends_on' => 'تاريخ نهاية السنة يجب أن يكون بعد تاريخ بدايتها.']);
++        }
++        $months = $start->diffInMonths($end->copy()->addDay());
++        if ($months < 10 || $months > 15) {
++            throw ValidationException::withMessages(['ends_on' => 'مدة سنة التخطيط يجب أن تكون بين 10 و15 شهرًا (أربعة أرباع).']);
++        }
++    }
++
++    /** تعديل بيانات السنة. تغيير التواريخ مسموح فقط قبل إقفال أي ربع، ويعيد حساب مواعيد الأرباع */
++    public function update(PlanningYear $y, User $by, array $data): PlanningYear
++    {
++        if ($y->isClosed()) {
++            throw ValidationException::withMessages(['year' => 'السنة مغلقة. أعد فتحها بسبب موثق قبل التعديل.']);
++        }
++
++        return DB::transaction(function () use ($y, $by, $data) {
++            $y->load('quarters');
++            $old = $y->only(self::EDITABLE) + ['starts_on' => $y->starts_on?->toDateString(), 'ends_on' => $y->ends_on?->toDateString()];
++            $y->fill(array_intersect_key($data, array_flip(self::EDITABLE)));
++
++            $start = isset($data['starts_on']) ? Carbon::parse($data['starts_on'])->startOfDay() : $y->starts_on;
++            $end = isset($data['ends_on']) ? Carbon::parse($data['ends_on'])->startOfDay() : $y->ends_on;
++            $datesChanged = $start && $end && ($start->toDateString() !== $old['starts_on'] || $end->toDateString() !== $old['ends_on']);
++            if ($datesChanged) {
++                if ($y->quarters->contains(fn ($q) => $q->isClosed())) {
++                    throw ValidationException::withMessages(['starts_on' => 'لا يمكن تغيير تواريخ السنة بعد إقفال أحد أرباعها.']);
++                }
++                $this->assertSpan($start, $end);
++                $y->starts_on = $start;
++                $y->ends_on = $end;
++                foreach ($this->quarterRanges($start, $end) as $n => [$qs, $qe]) {
++                    $y->quarters->firstWhere('number', $n)?->update(['starts_on' => $qs, 'ends_on' => $qe]);
++                }
++            }
++            $y->save();
++            $new = $y->only(self::EDITABLE) + ['starts_on' => $y->starts_on?->toDateString(), 'ends_on' => $y->ends_on?->toDateString()];
++            $diffOld = array_diff_assoc(array_map('strval', $old), array_map('strval', $new));
++            if ($diffOld) {
++                Audit::log('year.update', $y, array_intersect_key($old, $diffOld), array_intersect_key($new, $diffOld));
++            }
++
++            return $y;
++        });
++    }
++
++    public const TRANSITIONS = [
++        'activate' => ['from' => ['draft'], 'to' => 'open', 'label' => 'تفعيل السنة'],
++        'close' => ['from' => ['open'], 'to' => 'closed', 'label' => 'إغلاق السنة'],
++        'reopen' => ['from' => ['closed'], 'to' => 'open', 'label' => 'إعادة فتح السنة'],
++    ];
++
++    public function transition(PlanningYear $y, User $by, string $action, ?string $reason = null): PlanningYear
++    {
++        $t = self::TRANSITIONS[$action] ?? null;
++        abort_unless($t, 404);
++        if (! in_array($y->status, $t['from'], true)) {
++            throw ValidationException::withMessages(['status' => 'لا يمكن «' . $t['label'] . '» والسنة في حالة «' . $y->statusLabel() . '».']);
++        }
++        if ($action === 'close') {
++            $open = $y->quarters()->where('status', 'open')->pluck('number');
++            if ($open->isNotEmpty()) {
++                throw ValidationException::withMessages(['status' => 'أقفل كل الأرباع أولًا. الأرباع المفتوحة: ' . $open->map(fn ($n) => 'ر' . $n)->implode('، ') . '.']);
++            }
++        }
++        if ($action === 'reopen' && ! trim((string) $reason)) {
++            throw ValidationException::withMessages(['reason' => 'إعادة فتح سنة مغلقة تتطلب سببًا أو سندًا موثقًا.']);
++        }
++
++        return DB::transaction(function () use ($y, $by, $action, $t, $reason) {
++            $from = $y->status;
++            $y->status = $t['to'];
++            if ($action === 'close') {
++                $y->closed_at = now();
++                $y->closed_by = $by->id;
+             }
+-            Audit::log('year.create', $y, null, ['year' => $year]);
++            $y->save();
++            Audit::log('year.' . $action, $y, ['status' => $from], ['status' => $y->status, 'reason' => $reason]);
+ 
+             return $y;
+         });
+diff --git a/resources/views/years/edit.blade.php b/resources/views/years/edit.blade.php
+new file mode 100644
+index 0000000..5fe9d2a
+--- /dev/null
++++ b/resources/views/years/edit.blade.php
+@@ -0,0 +1,90 @@
++@extends('layouts.app')
++@section('title', 'إدارة ' . $year->displayName())
++@php use App\Support\Fmt; $locked = $year->isClosed(); $anyClosed = $year->quarters->contains(fn ($q) => $q->isClosed()); @endphp
++@section('content')
++<div class="ws-title">
++    <h1>{{ $year->displayName() }}</h1>
++    <span class="badge {{ ['draft' => 'draft', 'open' => 'active', 'closed' => 'closed'][$year->status] ?? '' }}">{{ $year->statusLabel() }}</span>
++    <a class="btn sec sm right" href="{{ route('years.index') }}">← السنوات والأرباع</a>
++</div>
++
++<div class="grid g-2-1">
++    <div class="card">
++        <h2>بيانات السنة</h2>
++        @if ($locked)
++            <div class="flash info small">السنة مغلقة منذ {{ Fmt::dt($year->closed_at) }} ({{ $year->closer?->name }}). أعد فتحها بسبب موثق لتعديلها.</div>
++        @endif
++        <form method="post" action="{{ route('years.update', $year) }}">@csrf @method('put')
++            <fieldset @disabled($locked) style="border:0;padding:0;margin:0">
++            <div class="form-grid">
++                <div class="field"><label class="f">السنة</label><input type="text" value="{{ $year->year }}" disabled></div>
++                <div class="field"><label class="f" for="e-name">اسم السنة</label><input id="e-name" type="text" name="name" value="{{ old('name', $year->name) }}" required></div>
++                <div class="field"><label class="f" for="e-s">تاريخ البداية</label><input id="e-s" type="date" name="starts_on" value="{{ old('starts_on', $year->starts_on?->toDateString()) }}" required @readonly($anyClosed)></div>
++                <div class="field"><label class="f" for="e-e">تاريخ النهاية</label><input id="e-e" type="date" name="ends_on" value="{{ old('ends_on', $year->ends_on?->toDateString()) }}" required @readonly($anyClosed)>
++                    @if ($anyClosed)<div class="hint">لا تُعدَّل التواريخ بعد إقفال أحد الأرباع.</div>@else<div class="hint">تغيير التواريخ يعيد حساب مواعيد الأرباع الأربعة.</div>@endif</div>
++                <div class="field"><label class="f" for="e-o">المسؤول عن السنة</label>
++                    <select id="e-o" name="owner_user_id"><option value="">—</option>@foreach ($users as $x)<option value="{{ $x->id }}" @selected(old('owner_user_id', $year->owner_user_id) == $x->id)>{{ $x->name }}</option>@endforeach</select></div>
++                <div class="field"><label class="f" for="e-d">موعد اعتماد الخطط</label><input id="e-d" type="date" name="plans_due_on" value="{{ old('plans_due_on', $year->plans_due_on?->toDateString()) }}"></div>
++                <div class="field full"><label class="f" for="e-desc">وصف أو توجهات السنة</label><textarea id="e-desc" name="description" rows="3">{{ old('description', $year->description) }}</textarea></div>
++            </div>
++            <button class="btn">حفظ</button>
++            </fieldset>
++        </form>
++    </div>
++
++    <div>
++        <div class="card">
++            <h2>حالة السنة</h2>
++            <div class="steps" style="margin-bottom:.8rem">
++                @foreach (\App\Models\PlanningYear::STATUSES as $k => $l)
++                    <span class="{{ $year->status === $k ? 'cur' : '' }}">{{ $l }}</span>@if (! $loop->last)<i>←</i>@endif
++                @endforeach
++            </div>
++            @if ($year->status === 'draft')
++                <form method="post" action="{{ route('years.transition', [$year, 'activate']) }}">@csrf
++                    <p class="small muted">السنة في طور التحضير: يمكن إعداد الخطط، ولا تُولَّد لها تنبيهات المتابعة حتى تُفعَّل.</p>
++                    <button class="btn">تفعيل السنة</button>
++                </form>
++            @elseif ($year->status === 'open')
++                <form method="post" action="{{ route('years.transition', [$year, 'close']) }}">@csrf
++                    <p class="small muted">يتطلب إقفال الأرباع الأربعة أولًا. بعد الإغلاق لا تُنشأ خطط جديدة في هذه السنة ولا تُعدَّل بياناتها.</p>
++                    <label class="f" for="c-r">ملاحظة الإغلاق (اختياري)</label>
++                    <textarea id="c-r" name="reason" rows="2"></textarea>
++                    <button class="btn dark" style="margin-top:.4rem" data-confirm="إغلاق {{ $year->displayName() }}؟">إغلاق السنة</button>
++                </form>
++            @else
++                <form method="post" action="{{ route('years.transition', [$year, 'reopen']) }}">@csrf
++                    <label class="f" for="r-r">سبب إعادة الفتح أو رقم القرار <span style="color:var(--bad)">*</span></label>
++                    <textarea id="r-r" name="reason" rows="2" required></textarea>
++                    <button class="btn danger" style="margin-top:.4rem">إعادة فتح السنة</button>
++                    <p class="hint">يُسجَّل السبب ومن أعاد الفتح ووقته في سجل التدقيق. لقطات الأرباع المغلقة تبقى كما هي.</p>
++                </form>
++            @endif
++        </div>
++
++        <div class="card">
++            <h2>الأرباع</h2>
++            @foreach ($year->quarters as $q)
++                <div class="row between small" style="padding:.2rem 0">
++                    <span>{{ $q->label() }}: <span class="num">{{ Fmt::date($q->starts_on) }}</span> – <span class="num">{{ Fmt::date($q->ends_on) }}</span></span>
++                    <span class="badge {{ $q->isClosed() ? 'closed' : 'outline' }}">{{ $q->isClosed() ? 'مغلق' : 'مفتوح' }}</span>
++                </div>
++            @endforeach
++        </div>
++    </div>
++</div>
++
++<div class="card">
++    <h2>سجل تغييرات السنة</h2>
++    <ul class="timeline">
++        @forelse ($history as $h)
++            <li><b>{{ ['year.create' => 'إنشاء', 'year.update' => 'تعديل', 'year.activate' => 'تفعيل', 'year.close' => 'إغلاق', 'year.reopen' => 'إعادة فتح'][$h->action] ?? $h->action }}</b> — {{ $h->user?->name ?? 'النظام' }}
++                @if ($h->old_values)<div class="small"><span class="diff-old">{{ json_encode($h->old_values, JSON_UNESCAPED_UNICODE) }}</span></div>@endif
++                @if ($h->new_values)<div class="small"><span class="diff-new">{{ json_encode($h->new_values, JSON_UNESCAPED_UNICODE) }}</span></div>@endif
++                <div class="when">{{ Fmt::dt($h->created_at) }}</div></li>
++        @empty
++            <li class="muted small">لا توجد تغييرات مسجلة.</li>
++        @endforelse
++    </ul>
++</div>
++@endsection
+diff --git a/resources/views/years/index.blade.php b/resources/views/years/index.blade.php
+index 49b5f3b..1779869 100644
+--- a/resources/views/years/index.blade.php
++++ b/resources/views/years/index.blade.php
+@@ -6,13 +6,26 @@
+ 
+ <div class="grid g2">
+     @if (Access::canManageYears($u))
++    @php $ny = ($years->max('year') ?? now()->year) + 1; @endphp
+     <div class="card">
+         <h2>إنشاء سنة تخطيط جديدة</h2>
+-        <form method="post" action="{{ route('years.store') }}" class="row">@csrf
+-            <input type="number" name="year" min="2020" max="2100" value="{{ ($years->max('year') ?? now()->year) + 1 }}" style="max-width:140px" required aria-label="السنة">
++        <form method="post" action="{{ route('years.store') }}">@csrf
++            <div class="form-grid">
++                <div class="field"><label class="f" for="y-year">السنة</label><input id="y-year" type="number" name="year" min="2020" max="2100" value="{{ old('year', $ny) }}" required
++                    oninput="var f=this.form; f.name.value='سنة التخطيط '+this.value; f.starts_on.value=this.value+'-01-01'; f.ends_on.value=this.value+'-12-31';"></div>
++                <div class="field"><label class="f" for="y-name">اسم السنة</label><input id="y-name" type="text" name="name" value="{{ old('name', 'سنة التخطيط ' . $ny) }}" required></div>
++                <div class="field"><label class="f" for="y-s">تاريخ البداية</label><input id="y-s" type="date" name="starts_on" value="{{ old('starts_on', $ny . '-01-01') }}" required></div>
++                <div class="field"><label class="f" for="y-e">تاريخ النهاية</label><input id="y-e" type="date" name="ends_on" value="{{ old('ends_on', $ny . '-12-31') }}" required></div>
++                <div class="field"><label class="f" for="y-o">المسؤول عن السنة</label>
++                    <select id="y-o" name="owner_user_id"><option value="">—</option>@foreach ($users as $x)<option value="{{ $x->id }}" @selected(old('owner_user_id', $u->id) == $x->id)>{{ $x->name }}</option>@endforeach</select></div>
++                <div class="field"><label class="f" for="y-d">موعد اعتماد الخطط</label><input id="y-d" type="date" name="plans_due_on" value="{{ old('plans_due_on') }}"></div>
++                <div class="field"><label class="f" for="y-st">الحالة عند الإنشاء</label>
++                    <select id="y-st" name="status"><option value="open" @selected(old('status', 'open') === 'open')>نشطة</option><option value="draft" @selected(old('status') === 'draft')>مسودة (للتحضير)</option></select></div>
++                <div class="field full"><label class="f" for="y-desc">وصف أو توجهات السنة (اختياري)</label><textarea id="y-desc" name="description" rows="2">{{ old('description') }}</textarea></div>
++            </div>
+             <button class="btn">إنشاء السنة بأرباعها الأربعة</button>
+         </form>
+-        <p class="hint">تُنشأ الأرباع تلقائيًا: يناير–مارس، أبريل–يونيو، يوليو–سبتمبر، أكتوبر–ديسمبر. بعدها ينشئ كل مسؤول خطته أو ينسخ هيكل خطته السابقة.</p>
++        <p class="hint">تُقسم السنة تلقائيًا إلى أربعة أرباع مدة كل منها ثلاثة أشهر من تاريخ البداية. بعدها ينشئ كل مسؤول خطته أو ينسخ هيكل خطته السابقة.</p>
+     </div>
+     @endif
+     @if (Access::canReview($u) || Access::isPresident($u))
+@@ -34,7 +47,24 @@
+ 
+ @foreach ($years as $y)
+     <div class="card">
+-        <div class="card-head"><h2>سنة {{ $y->year }}</h2><span class="small muted">{{ $y->plans->count() }} خطة</span></div>
++        <div class="card-head">
++            <div>
++                <h2>{{ $y->displayName() }} <span class="badge {{ ['draft' => 'draft', 'open' => 'active', 'closed' => 'closed'][$y->status] ?? '' }}">{{ $y->statusLabel() }}</span></h2>
++                <span class="small muted"><span class="num">{{ Fmt::date($y->starts_on) }}</span> – <span class="num">{{ Fmt::date($y->ends_on) }}</span>
++                    · المسؤول: {{ $y->owner?->name ?? '—' }}
++                    · موعد اعتماد الخطط: @if ($y->plans_due_on)<span class="num">{{ Fmt::date($y->plans_due_on) }}</span>@if ($y->plansOverdue() && ! $y->isClosed()) <span class="badge overdue">فات الموعد</span>@endif @else — @endif
++                    · {{ $y->plans->count() }} خطة</span>
++            </div>
++            @if (Access::canManageYears($u))
++                <div class="row">
++                    <a class="btn sec sm" href="{{ route('years.edit', $y) }}">إدارة السنة</a>
++                    @if ($y->status === 'draft')
++                        <form method="post" action="{{ route('years.transition', [$y, 'activate']) }}" class="inline">@csrf<button class="btn sm" data-confirm="تفعيل {{ $y->displayName() }}؟">تفعيل السنة</button></form>
++                    @endif
++                </div>
++            @endif
++        </div>
++        @if ($y->description)<p class="small">{{ $y->description }}</p>@endif
+         <div class="quarters">
+             @foreach ($y->quarters as $qq)
+                 <div class="qcard">
+@@ -42,7 +72,7 @@
+                     <div class="d"><span class="num">{{ Fmt::date($qq->starts_on) }}</span> – <span class="num">{{ Fmt::date($qq->ends_on) }}</span></div>
+                     @if ($qq->isClosed())
+                         <div class="small muted">أُقفل {{ Fmt::dt($qq->closed_at) }}</div>
+-                    @elseif (Access::canReview($u))
++                    @elseif (Access::canReview($u) && ! $y->isClosed())
+                         <form method="post" action="{{ route('quarters.close', [$y, $qq->number]) }}" style="margin-top:.4rem">@csrf
+                             <button class="btn dark sm" data-confirm="إقفال {{ $qq->label() }} {{ $y->year }} يحفظ لقطة من الخطط والنتائج والاعتمادات، ولا تُعدّل نتائجه بعدها إلا بطلب تغيير. متابعة؟">إقفال الربع</button>
+                         </form>
+diff --git a/routes/web.php b/routes/web.php
+index 5531bfb..e3b84b0 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -91,6 +91,9 @@
+     // السنوات والأرباع
+     Route::get('/years', [YearController::class, 'index'])->name('years.index');
+     Route::post('/years', [YearController::class, 'store'])->name('years.store');
++    Route::get('/years/{year}/edit', [YearController::class, 'edit'])->name('years.edit');
++    Route::put('/years/{year}', [YearController::class, 'update'])->name('years.update');
++    Route::post('/years/{year}/status/{action}', [YearController::class, 'transition'])->whereIn('action', array_keys(\App\Services\YearService::TRANSITIONS))->name('years.transition');
+     Route::post('/years/{year}/quarters/{number}/close', [YearController::class, 'closeQuarter'])->whereNumber('number')->name('quarters.close');
+     Route::post('/years/rules', [YearController::class, 'rules'])->name('rules.store');
+ 
+diff --git a/tests/Feature/YearManagementTest.php b/tests/Feature/YearManagementTest.php
+new file mode 100644
+index 0000000..6c85465
+--- /dev/null
++++ b/tests/Feature/YearManagementTest.php
+@@ -0,0 +1,134 @@
++<?php
++
++namespace Tests\Feature;
++
++use App\Models\AuditLog;
++use App\Models\PlanningYear;
++use App\Models\Position;
++use App\Services\YearService;
++use Tests\TestCase;
++
++/** المرحلة الأولى — إنشاء وإدارة السنوات التخطيطية */
++class YearManagementTest extends TestCase
++{
++    private function payload(array $over = []): array
++    {
++        return array_merge(['year' => 2028, 'name' => 'خطة 2028 التشغيلية', 'starts_on' => '2028-01-01', 'ends_on' => '2028-12-31',
++            'owner_user_id' => $this->user(Position::PLANNING)->id, 'plans_due_on' => '2027-12-15', 'status' => 'draft', 'description' => 'توجهات'], $over);
++    }
++
++    public function test_planner_creates_year_with_details_and_quarters(): void
++    {
++        $this->as(Position::PLANNING)->post(route('years.store'), $this->payload())->assertSessionHasNoErrors()->assertRedirect(route('years.index'));
++        $y = PlanningYear::where('year', 2028)->with('quarters')->firstOrFail();
++        $this->assertSame('خطة 2028 التشغيلية', $y->name);
++        $this->assertSame('draft', $y->status);
++        $this->assertSame('2027-12-15', $y->plans_due_on->toDateString());
++        $this->assertSame($this->user(Position::PLANNING)->id, $y->owner_user_id);
++        $this->assertSame(
++            [['2028-01-01', '2028-03-31'], ['2028-04-01', '2028-06-30'], ['2028-07-01', '2028-09-30'], ['2028-10-01', '2028-12-31']],
++            $y->quarters->map(fn ($q) => [$q->starts_on->toDateString(), $q->ends_on->toDateString()])->all()
++        );
++        $this->assertDatabaseHas('audit_logs', ['action' => 'year.create', 'entity_id' => $y->id]);
++        $this->get(route('years.index'))->assertOk()->assertSee('خطة 2028 التشغيلية')->assertSee('مسودة');
++        $this->get(route('years.edit', $y))->assertOk();
++    }
++
++    public function test_fiscal_year_not_starting_in_january_splits_into_quarters(): void
++    {
++        $this->as(Position::PRESIDENT)->post(route('years.store'), $this->payload(['starts_on' => '2027-07-01', 'ends_on' => '2028-06-30']))->assertSessionHasNoErrors();
++        $q = PlanningYear::where('year', 2028)->first()->quarters;
++        $this->assertSame('2027-10-01', $q[1]->starts_on->toDateString());
++        $this->assertSame('2028-06-30', $q[3]->ends_on->toDateString());
++    }
++
++    public function test_invalid_dates_are_rejected_with_arabic_message(): void
++    {
++        $this->as(Position::PLANNING)->post(route('years.store'), $this->payload(['ends_on' => '2028-03-31']))->assertSessionHasErrors('ends_on');
++        $this->assertFalse(PlanningYear::where('year', 2028)->exists());
++        $this->post(route('years.store'), $this->payload(['year' => 2026]))->assertSessionHasErrors('year');
++    }
++
++    public function test_only_president_and_planning_manage_years(): void
++    {
++        $y = PlanningYear::where('year', 2027)->first();
++        foreach ([Position::ENGINEERING, Position::VICE_PRESIDENT, 'admin'] as $who) {
++            $this->as($who);
++            $this->post(route('years.store'), $this->payload())->assertForbidden();
++            $this->get(route('years.edit', $y))->assertForbidden();
++            $this->put(route('years.update', $y), ['name' => 'x', 'starts_on' => '2027-01-01', 'ends_on' => '2027-12-31'])->assertForbidden();
++            $this->post(route('years.transition', [$y, 'close']))->assertForbidden();
++        }
++        $this->as(Position::PRESIDENT)->get(route('years.edit', $y))->assertOk();
++    }
++
++    public function test_update_records_old_and_new_values_and_recomputes_quarters(): void
++    {
++        $y = PlanningYear::where('year', 2027)->first();
++        $this->as(Position::PLANNING)->put(route('years.update', $y), ['name' => 'سنة 2027 المعدلة', 'starts_on' => '2027-02-01', 'ends_on' => '2028-01-31',
++            'owner_user_id' => $this->user(Position::PRESIDENT)->id, 'plans_due_on' => '2027-01-20'])->assertSessionHasNoErrors();
++        $y->refresh()->load('quarters');
++        $this->assertSame('2027-02-01', $y->quarters[0]->starts_on->toDateString());
++        $this->assertSame('2028-01-31', $y->quarters[3]->ends_on->toDateString());
++        $log = AuditLog::where('action', 'year.update')->where('entity_id', $y->id)->latest('id')->first();
++        $this->assertSame('سنة التخطيط 2027', $log->old_values['name']);
++        $this->assertSame('سنة 2027 المعدلة', $log->new_values['name']);
++        $this->assertSame('2027-01-01', $log->old_values['starts_on']);
++    }
++
++    public function test_dates_are_frozen_after_a_quarter_is_closed(): void
++    {
++        $y = PlanningYear::where('year', 2026)->first(); // الربع الأول مغلق في البيانات التجريبية
++        $this->as(Position::PLANNING)->put(route('years.update', $y), ['name' => $y->name, 'starts_on' => '2026-02-01', 'ends_on' => '2027-01-31'])->assertSessionHasErrors('starts_on');
++        $this->assertSame('2026-01-01', $y->fresh()->starts_on->toDateString());
++        // تعديل الاسم دون التواريخ مسموح
++        $this->put(route('years.update', $y), ['name' => 'سنة 2026', 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31'])->assertSessionHasNoErrors();
++        $this->assertSame('سنة 2026', $y->fresh()->name);
++    }
++
++    public function test_lifecycle_activate_close_reopen(): void
++    {
++        $this->as(Position::PLANNING)->post(route('years.store'), $this->payload())->assertSessionHasNoErrors();
++        $y = PlanningYear::where('year', 2028)->first();
++
++        $this->post(route('years.transition', [$y, 'close']))->assertSessionHasErrors('status'); // مسودة لا تُغلق
++        $this->post(route('years.transition', [$y, 'activate']))->assertSessionHasNoErrors();
++        $this->assertSame('open', $y->fresh()->status);
++
++        $this->post(route('years.transition', [$y, 'close']))->assertSessionHasErrors('status'); // الأرباع مفتوحة
++        $y->quarters()->update(['status' => 'closed']);
++        $this->post(route('years.transition', [$y, 'close']), ['reason' => 'اعتماد التقرير الختامي'])->assertSessionHasNoErrors();
++        $y->refresh();
++        $this->assertSame('closed', $y->status);
++        $this->assertNotNull($y->closed_at);
++        $this->assertSame($this->user(Position::PLANNING)->id, $y->closed_by);
++
++        // السنة المغلقة: لا خطط جديدة ولا تعديل بيانات
++        $this->as(Position::MEDIA)->post(route('plans.store'), ['position_id' => Position::where('code', Position::MEDIA)->value('id'), 'planning_year_id' => $y->id])->assertStatus(422);
++        $this->as(Position::PLANNING)->put(route('years.update', $y), ['name' => 'x', 'starts_on' => '2028-01-01', 'ends_on' => '2028-12-31'])->assertSessionHasErrors('year');
++
++        // إعادة الفتح تتطلب سببًا موثقًا
++        $this->post(route('years.transition', [$y, 'reopen']))->assertSessionHasErrors('reason');
++        $this->post(route('years.transition', [$y, 'reopen']), ['reason' => 'قرار المجلس رقم 12'])->assertSessionHasNoErrors();
++        $this->assertSame('open', $y->fresh()->status);
++        $this->assertDatabaseHas('audit_logs', ['action' => 'year.reopen', 'entity_id' => $y->id]);
++        $this->assertSame('قرار المجلس رقم 12', AuditLog::where('action', 'year.reopen')->latest('id')->first()->new_values['reason']);
++        foreach (['year.activate', 'year.close'] as $a) {
++            $this->assertDatabaseHas('audit_logs', ['action' => $a, 'entity_id' => $y->id]);
++        }
++    }
++
++    public function test_multiple_active_years_are_allowed(): void
++    {
++        $this->as(Position::PLANNING)->post(route('years.store'), $this->payload(['status' => 'open']))->assertSessionHasNoErrors();
++        $this->assertSame(3, PlanningYear::where('status', 'open')->count());
++    }
++
++    public function test_legacy_create_signature_still_creates_active_calendar_year(): void
++    {
++        $y = app(YearService::class)->create(2030, $this->user(Position::PLANNING));
++        $this->assertSame('open', $y->status);
++        $this->assertSame('2030-01-01', $y->starts_on->toDateString());
++        $this->assertSame(4, $y->quarters()->count());
++    }
++}
+-- 
+2.43.0
+
+
+From c45b0ed15518a2190260717e4ee6f9de66116bb5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 29 Sep 2026 13:52:20 +0300
+Subject: [PATCH 3/5] Phase C: strategic goals, objective linking,
+ change-request support
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Vb8qconasCSK3LJTpKLmPr
+---
+ .../Controllers/ChangeRequestController.php   |   5 +-
+ app/Http/Controllers/PlanController.php       |   9 +-
+ app/Http/Controllers/PlanItemController.php   |  97 +++++++++---
+ app/Http/Controllers/SearchController.php     |   6 +-
+ .../Controllers/StrategicGoalController.php   | 113 +++++++++++++
+ app/Http/Controllers/WorkflowController.php   |   2 +-
+ app/Services/ChangeRequestService.php         |  16 +-
+ app/Services/Export/ExportService.php         |  13 +-
+ app/Services/Export/ReportBuilder.php         |   6 +-
+ app/Services/PlanSnapshot.php                 |   8 +-
+ app/Services/PlanValidator.php                |  18 ++-
+ app/Services/PlanWorkflow.php                 |   2 +-
+ app/Support/Access.php                        |   5 +
+ .../views/change-requests/create.blade.php    |   6 +
+ .../views/change-requests/show.blade.php      |   4 +-
+ resources/views/layouts/app.blade.php         |   3 +
+ .../views/plans/_activity-fields.blade.php    |  12 ++
+ .../views/plans/_project-fields.blade.php     |   4 +-
+ resources/views/plans/_task-fields.blade.php  |   4 +-
+ resources/views/plans/_tasks-editor.blade.php |  18 +++
+ resources/views/plans/edit.blade.php          |  60 +++++--
+ resources/views/plans/index.blade.php         |   3 +-
+ resources/views/plans/objective.blade.php     |   8 +-
+ resources/views/plans/project.blade.php       |  53 +++++--
+ resources/views/plans/review.blade.php        |   3 +-
+ resources/views/plans/tabs/overview.blade.php |  26 ++-
+ resources/views/plans/tabs/tasks.blade.php    |   5 +-
+ .../views/strategic-goals/index.blade.php     |  45 ++++++
+ .../views/strategic-goals/show.blade.php      |  89 +++++++++++
+ routes/web.php                                |   9 ++
+ tests/Feature/StrategicGoalTest.php           | 149 ++++++++++++++++++
+ 31 files changed, 709 insertions(+), 92 deletions(-)
+ create mode 100644 app/Http/Controllers/StrategicGoalController.php
+ create mode 100644 resources/views/plans/_activity-fields.blade.php
+ create mode 100644 resources/views/plans/_tasks-editor.blade.php
+ create mode 100644 resources/views/strategic-goals/index.blade.php
+ create mode 100644 resources/views/strategic-goals/show.blade.php
+ create mode 100644 tests/Feature/StrategicGoalTest.php
+
+diff --git a/app/Http/Controllers/ChangeRequestController.php b/app/Http/Controllers/ChangeRequestController.php
+index 7aa8e65..6085c28 100644
+--- a/app/Http/Controllers/ChangeRequestController.php
++++ b/app/Http/Controllers/ChangeRequestController.php
+@@ -22,11 +22,12 @@ public function create(Request $r, Plan $plan)
+     {
+         $this->canView($plan);
+         abort_unless(app(ChangeRequestService::class)->canRequest($r->user(), $plan), 403, 'طلب التعديل متاح لصاحب المنصب ومسؤول التخطيط على خطة معتمدة أو نشطة.');
+-        $plan->load(['objectives.indicators.targets', 'year.quarters', 'position']);
++        $plan->load(['objectives.indicators.targets', 'objectives.strategicGoal', 'year.quarters', 'position']);
++        $goals = \App\Models\StrategicGoal::usableFor($plan->year->year)->get();
+         $type = $r->query('type', 'plan_amendment');
+         $indicator = $type === 'closed_quarter_result' ? $plan->indicators()->findOrFail($r->integer('indicator')) : null;
+ 
+-        return view('change-requests.create', compact('plan', 'type', 'indicator'));
++        return view('change-requests.create', compact('plan', 'type', 'indicator', 'goals'));
+     }
+ 
+     public function store(Request $r, Plan $plan)
+diff --git a/app/Http/Controllers/PlanController.php b/app/Http/Controllers/PlanController.php
+index 700ac3e..57db977 100644
+--- a/app/Http/Controllers/PlanController.php
++++ b/app/Http/Controllers/PlanController.php
+@@ -66,7 +66,7 @@ public function show(Request $request, Plan $plan)
+     {
+         $this->canView($plan);
+         $u = $request->user();
+-        $plan->load(['position', 'year.quarters', 'owner', 'objectives.indicators.targets', 'projects.tasks']);
++        $plan->load(['position', 'year.quarters', 'owner', 'objectives.indicators.targets', 'objectives.strategicGoal', 'projects.tasks']);
+         $q = $this->selectedQuarter();
+         $tab = $request->query('tab', 'overview');
+         $results = $plan->objectives->isNotEmpty() ? (new Results())->plan($plan, $q) : null;
+@@ -80,7 +80,7 @@ public function show(Request $request, Plan $plan)
+ 
+         switch ($tab) {
+             case 'tasks':
+-                $data['tasks'] = $plan->tasks()->with(['project', 'deferrals', 'owner'])->get();
++                $data['tasks'] = $plan->tasks()->with(['project.parent', 'deferrals', 'owner'])->get();
+                 $data['users'] = User::where('is_active', true)->orderBy('name')->get(['id', 'name']);
+                 break;
+             case 'updates':
+@@ -114,10 +114,11 @@ public function show(Request $request, Plan $plan)
+     public function edit(Plan $plan)
+     {
+         $this->canEdit($plan);
+-        $plan->load(['objectives.indicators', 'projects', 'position', 'year']);
++        $plan->load(['objectives.indicators', 'objectives.strategicGoal', 'projects.owner', 'projects.activities.owner', 'projects.activities.tasks.owner', 'projects.tasks.owner', 'position', 'year']);
+         $errors_list = (new PlanValidator())->errors($plan);
++        $goals = \App\Models\StrategicGoal::usableFor($plan->year->year)->get();
+ 
+-        return view('plans.edit', compact('plan', 'errors_list'));
++        return view('plans.edit', compact('plan', 'errors_list', 'goals'));
+     }
+ 
+     public function update(Request $request, Plan $plan)
+diff --git a/app/Http/Controllers/PlanItemController.php b/app/Http/Controllers/PlanItemController.php
+index e8a0cc0..97c44b1 100644
+--- a/app/Http/Controllers/PlanItemController.php
++++ b/app/Http/Controllers/PlanItemController.php
+@@ -19,20 +19,37 @@ private function back(Plan $plan, string $msg, string $anchor = '')
+         return redirect(route('plans.edit', $plan) . $anchor)->with('ok', $msg);
+     }
+ 
++    /** الهدف الاستراتيجي يجب أن يكون فعّالًا ويغطي سنة الخطة (أو هو الربط الحالي نفسه) */
++    private function checkGoal(Plan $plan, ?int $goalId, ?int $current = null): void
++    {
++        if (! $goalId || $goalId === $current) {
++            return;
++        }
++        $ok = \App\Models\StrategicGoal::whereKey($goalId)->usableFor($plan->year->year)->exists();
++        if (! $ok) {
++            throw \Illuminate\Validation\ValidationException::withMessages(['strategic_goal_id' => 'الهدف الاستراتيجي المختار مؤرشف أو لا يغطي سنة الخطة.']);
++        }
++    }
++
++    private const OBJ_RULES = ['title' => 'required|string|max:255', 'description' => 'nullable|string', 'weight' => 'nullable|numeric|min:0|max:100', 'strategic_goal_id' => 'nullable|integer|exists:strategic_goals,id'];
++
+     public function storeObjective(Request $r, Plan $plan)
+     {
+         $this->canEdit($plan);
+-        $d = $r->validate(['title' => 'required|string|max:255', 'description' => 'nullable|string', 'weight' => 'nullable|numeric|min:0|max:100'], [], ['title' => 'عنوان الهدف', 'weight' => 'الوزن']);
++        $d = $r->validate(self::OBJ_RULES, [], ['title' => 'عنوان الهدف', 'weight' => 'الوزن', 'strategic_goal_id' => 'الهدف الاستراتيجي']);
++        $this->checkGoal($plan, $d['strategic_goal_id'] ?? null);
+         $o = $plan->objectives()->create($d + ['sort' => $plan->objectives()->count()]);
+-        Audit::log('objective.create', $o, null, $d);
++        Audit::log('objective.create', $o, null, ['ref' => $o->ref] + $d);
+ 
+-        return $this->back($plan, 'أُضيف الهدف. أضف له مؤشرًا قابلًا للقياس.', '#obj-' . $o->id);
++        return $this->back($plan, 'أُضيف الهدف ' . $o->ref . '. أضف له مؤشرًا قابلًا للقياس.', '#obj-' . $o->id);
+     }
+ 
+     public function updateObjective(Request $r, Objective $objective)
+     {
+         $this->canEdit($objective->plan);
+-        $d = $r->validate(['title' => 'required|string|max:255', 'description' => 'nullable|string', 'weight' => 'nullable|numeric|min:0|max:100']);
++        $d = $r->validate(self::OBJ_RULES, [], ['title' => 'عنوان الهدف', 'weight' => 'الوزن', 'strategic_goal_id' => 'الهدف الاستراتيجي']);
++        $d['strategic_goal_id'] ??= null;
++        $this->checkGoal($objective->plan, $d['strategic_goal_id'], $objective->strategic_goal_id);
+         $old = $objective->only(array_keys($d));
+         $objective->update($d);
+         Audit::log('objective.update', $objective, $old, $d);
+@@ -60,51 +77,89 @@ public function showObjective(Objective $objective)
+         return view('plans.objective', compact('plan', 'objective', 'q', 'result'));
+     }
+ 
++    private const PROJECT_LABELS = ['name' => 'الاسم', 'ends_on' => 'تاريخ الانتهاء', 'parent_id' => 'المبادرة الأم', 'type' => 'النوع'];
++
+     private function projectRules(): array
+     {
+-        return ['type' => 'required|in:initiative,project', 'name' => 'required|string|max:255', 'description' => 'nullable|string',
+-            'objective_id' => 'nullable|integer', 'responsible' => 'nullable|string|max:255', 'owner_user_id' => 'nullable|exists:users,id',
++        return ['type' => 'required|in:initiative,project,activity', 'name' => 'required|string|max:255', 'description' => 'nullable|string',
++            'objective_id' => 'nullable|integer', 'parent_id' => 'nullable|integer', 'responsible' => 'nullable|string|max:255', 'owner_user_id' => 'nullable|exists:users,id',
+             'starts_on' => 'nullable|date', 'ends_on' => 'nullable|date|after_or_equal:starts_on', 'resources' => 'nullable|string'];
+     }
+ 
++    /**
++     * التسلسل: مبادرة/مشروع (مستوى أول) ← نشاط (مستوى ثانٍ فقط) ← مهام.
++     * النشاط يرث هدف مبادرته، ولا يمكن إنشاء نشاط تحت نشاط.
++     */
++    private function normalizeHierarchy(Plan $plan, array $d): array
++    {
++        if (! empty($d['parent_id'])) {
++            $parent = $plan->projects()->whereKey($d['parent_id'])->first();
++            if (! $parent || $parent->parent_id) {
++                throw \Illuminate\Validation\ValidationException::withMessages(['parent_id' => 'يُضاف النشاط تحت مبادرة أو مشروع من الخطة نفسها فقط.']);
++            }
++            $d['type'] = 'activity';
++            $d['objective_id'] = $parent->objective_id;
++        } else {
++            $d['parent_id'] = null;
++            if ($d['type'] === 'activity') {
++                throw \Illuminate\Validation\ValidationException::withMessages(['parent_id' => 'اختر المبادرة التي يتبعها النشاط.']);
++            }
++        }
++        abort_if(! empty($d['objective_id']) && ! $plan->objectives()->whereKey($d['objective_id'])->exists(), 422);
++
++        return $d;
++    }
++
+     public function storeProject(Request $r, Plan $plan)
+     {
+         $this->canEdit($plan);
+-        $d = $r->validate($this->projectRules(), [], ['name' => 'اسم المشروع', 'ends_on' => 'تاريخ الانتهاء']);
+-        abort_if($d['objective_id'] && ! $plan->objectives()->whereKey($d['objective_id'])->exists(), 422);
++        $d = $this->normalizeHierarchy($plan, $r->validate($this->projectRules(), [], self::PROJECT_LABELS));
+         $p = $plan->projects()->create($d);
+-        Audit::log('project.create', $p, null, $d);
++        Audit::log($p->isActivity() ? 'activity.create' : 'project.create', $p, null, ['ref' => $p->ref] + $d);
+ 
+-        return $this->back($plan, 'أُضيف المشروع/المبادرة.', '#projects');
++        return $this->back($plan, 'أُضيف ' . $p->typeLabel() . ' ' . $p->ref . '.', '#projects');
+     }
+ 
+     public function updateProject(Request $r, Project $project)
+     {
+-        $this->canEdit($project->plan);
+-        $d = $r->validate($this->projectRules());
+-        abort_if($d['objective_id'] && ! $project->plan->objectives()->whereKey($d['objective_id'])->exists(), 422);
++        $plan = $project->plan;
++        $this->canEdit($plan);
++        $d = $r->validate($this->projectRules(), [], self::PROJECT_LABELS);
++        // المستوى لا يتغير بعد الإنشاء: لا يتحول النشاط إلى مبادرة ولا العكس، ويحتفظ برقمه المرجعي
++        $d['parent_id'] = $project->parent_id;
++        $d['type'] = $project->isActivity() ? 'activity' : ($d['type'] === 'activity' ? $project->type : $d['type']);
++        $d = $this->normalizeHierarchy($plan, $d);
+         $old = $project->only(array_keys($d));
+         $project->update($d);
+-        Audit::log('project.update', $project, $old, $d);
+-
+-        return $this->back($project->plan, 'حُفظ المشروع.', '#projects');
++        if (! $project->isActivity() && array_key_exists('objective_id', $d)) {
++            $project->activities()->update(['objective_id' => $project->objective_id]);
++        }
++        $changed = array_keys(array_diff_assoc(array_map('strval', $project->only(array_keys($d))), array_map('strval', $old)));
++        if ($changed) {
++            Audit::log($project->isActivity() ? 'activity.update' : 'project.update', $project, array_intersect_key($old, array_flip($changed)), $project->only($changed) + ['ref' => $project->ref]);
++        }
++
++        return $this->back($plan, 'حُفظ ' . $project->typeLabel() . ' ' . $project->ref . '.', '#projects');
+     }
+ 
+     public function destroyProject(Project $project)
+     {
+         $plan = $project->plan;
+         $this->canEdit($plan);
+-        Audit::log('project.delete', $project, $project->toArray(), null);
++        if ($project->activities()->exists()) {
++            throw \Illuminate\Validation\ValidationException::withMessages(['project' => 'احذف أنشطة «' . $project->name . '» أولًا، أو انقل مهامها.']);
++        }
++        Audit::log($project->isActivity() ? 'activity.delete' : 'project.delete', $project, $project->toArray(), null);
+         $project->delete();
+ 
+-        return $this->back($plan, 'حُذف المشروع.', '#projects');
++        return $this->back($plan, 'حُذف ' . $project->typeLabel() . ' ' . $project->ref . '، وبقيت مهامه دون ارتباط. رقمه المرجعي لن يُعاد استخدامه.', '#projects');
+     }
+ 
+     public function showProject(Project $project)
+     {
+         $plan = $project->plan;
+         $this->canView($plan);
+-        $project->load(['tasks.deferrals', 'tasks.owner', 'objective']);
++        $project->load(['tasks.deferrals', 'tasks.owner', 'objective.strategicGoal', 'owner', 'parent', 'activities.tasks.deferrals', 'activities.tasks.owner', 'activities.owner']);
+ 
+         return view('plans.project', compact('plan', 'project'));
+     }
+@@ -122,7 +177,7 @@ public function storeTask(Request $r, Plan $plan)
+         $d = $r->validate($this->taskRules(), [], ['title' => 'عنوان المهمة', 'quarter' => 'الربع']);
+         abort_if($d['project_id'] && ! $plan->projects()->whereKey($d['project_id'])->exists(), 422);
+         $t = $plan->tasks()->create($d + ['original_quarter' => $d['quarter'], 'status' => 'planned']);
+-        Audit::log('task.create', $t, null, $d);
++        Audit::log('task.create', $t, null, ['ref' => $t->ref] + $d);
+ 
+         return $this->back($plan, 'أُضيفت المهمة.', '#projects');
+     }
+@@ -134,7 +189,7 @@ public function updateTask(Request $r, Task $task)
+         abort_if($d['project_id'] && ! $task->plan->projects()->whereKey($d['project_id'])->exists(), 422);
+         $old = $task->only(array_keys($d));
+         $task->update($d + ['original_quarter' => $d['quarter']]);
+-        Audit::log('task.update', $task, $old, $d);
++        Audit::log('task.update', $task, $old, ['ref' => $task->ref] + $d);
+ 
+         return $this->back($task->plan, 'حُفظت المهمة.', '#projects');
+     }
+diff --git a/app/Http/Controllers/SearchController.php b/app/Http/Controllers/SearchController.php
+index c24abaa..80c313f 100644
+--- a/app/Http/Controllers/SearchController.php
++++ b/app/Http/Controllers/SearchController.php
+@@ -23,10 +23,10 @@ public static function run($user, string $term): array
+         $with = ['plan.position', 'plan.year'];
+ 
+         return [
+-            'objectives' => Objective::whereIn('plan_id', $plans)->where(fn ($q) => $q->where('title', 'like', $like)->orWhere('description', 'like', $like))->with($with)->limit(20)->get(),
++            'objectives' => Objective::whereIn('plan_id', $plans)->where(fn ($q) => $q->where('title', 'like', $like)->orWhere('description', 'like', $like)->orWhere('ref', 'like', $like))->with($with)->limit(20)->get(),
+             'indicators' => Indicator::whereIn('plan_id', $plans)->where(fn ($q) => $q->where('name', 'like', $like)->orWhere('definition', 'like', $like))->with($with)->limit(20)->get(),
+-            'projects' => Project::whereIn('plan_id', $plans)->where(fn ($q) => $q->where('name', 'like', $like)->orWhere('description', 'like', $like))->with($with)->limit(20)->get(),
+-            'tasks' => Task::whereIn('plan_id', $plans)->where('title', 'like', $like)->with($with)->limit(20)->get(),
++            'projects' => Project::whereIn('plan_id', $plans)->where(fn ($q) => $q->where('name', 'like', $like)->orWhere('description', 'like', $like)->orWhere('ref', 'like', $like))->with($with)->limit(20)->get(),
++            'tasks' => Task::whereIn('plan_id', $plans)->where(fn ($q) => $q->where('title', 'like', $like)->orWhere('ref', 'like', $like))->with($with)->limit(20)->get(),
+         ];
+     }
+ 
+diff --git a/app/Http/Controllers/StrategicGoalController.php b/app/Http/Controllers/StrategicGoalController.php
+new file mode 100644
+index 0000000..42d7c98
+--- /dev/null
++++ b/app/Http/Controllers/StrategicGoalController.php
+@@ -0,0 +1,113 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Models\Objective;
++use App\Models\StrategicGoal;
++use App\Support\Access;
++use App\Support\Audit;
++use Illuminate\Http\Request;
++
++/**
++ * الأهداف الاستراتيجية للجمعية.
++ * - الإدارة (إنشاء/تعديل/أرشفة/حذف غير المرتبط): الرئيس ومسؤولة التخطيط.
++ * - الاطلاع: كل صاحب منصب. صاحب المنصب المقيّد يرى أهداف خطته المرتبطة فقط، ولا يرى أهداف خطط المناصب الأخرى.
++ */
++class StrategicGoalController extends Controller
++{
++    private const LABELS = ['title' => 'عنوان الهدف الاستراتيجي', 'from_year' => 'من سنة', 'to_year' => 'إلى سنة', 'description' => 'الوصف', 'sort' => 'الترتيب'];
++
++    private function rules(): array
++    {
++        return [
++            'title' => 'required|string|max:255',
++            'description' => 'nullable|string|max:5000',
++            'from_year' => 'nullable|integer|min:2020|max:2100',
++            'to_year' => 'nullable|integer|min:2020|max:2100|gte:from_year',
++            'sort' => 'nullable|integer|min:0|max:999',
++        ];
++    }
++
++    private function guardManage(): void
++    {
++        abort_unless(Access::canManageStrategicGoals(auth()->user()), 403, 'إدارة الأهداف الاستراتيجية للرئيس ومسؤولة التخطيط والمتابعة.');
++    }
++
++    /** أهداف الخطط المرتبطة التي يحق للمستخدم رؤيتها فقط */
++    private function visibleObjectives(StrategicGoal $g)
++    {
++        return Objective::where('strategic_goal_id', $g->id)
++            ->whereIn('plan_id', Access::visiblePlans(auth()->user())->select('id'))
++            ->with(['plan.position', 'plan.year'])->orderBy('plan_id')->get();
++    }
++
++    public function index()
++    {
++        abort_unless(Access::canSeeStrategicGoals(auth()->user()), 403);
++        $goals = StrategicGoal::orderByRaw("CASE WHEN status = 'active' THEN 0 ELSE 1 END")->orderBy('sort')->orderBy('id')->get();
++        $visible = Access::visiblePlans(auth()->user())->select('id');
++        $counts = Objective::whereIn('plan_id', $visible)->whereNotNull('strategic_goal_id')
++            ->selectRaw('strategic_goal_id, count(*) as n')->groupBy('strategic_goal_id')->pluck('n', 'strategic_goal_id');
++        $canManage = Access::canManageStrategicGoals(auth()->user());
++
++        return view('strategic-goals.index', compact('goals', 'counts', 'canManage'));
++    }
++
++    public function show(StrategicGoal $goal)
++    {
++        abort_unless(Access::canSeeStrategicGoals(auth()->user()), 403);
++        $objectives = $this->visibleObjectives($goal);
++        $canManage = Access::canManageStrategicGoals(auth()->user());
++        $history = $canManage ? \App\Models\AuditLog::where('entity_type', 'StrategicGoal')->where('entity_id', $goal->id)->with('user')->latest('id')->get() : collect();
++        $linkedTotal = $canManage ? Objective::where('strategic_goal_id', $goal->id)->count() : null;
++
++        return view('strategic-goals.show', compact('goal', 'objectives', 'canManage', 'history', 'linkedTotal'));
++    }
++
++    public function store(Request $r)
++    {
++        $this->guardManage();
++        $d = $r->validate($this->rules(), [], self::LABELS);
++        $g = StrategicGoal::create($d + ['status' => 'active', 'created_by' => $r->user()->id, 'sort' => $d['sort'] ?? (int) StrategicGoal::max('sort') + 1]);
++        Audit::log('strategic_goal.create', $g, null, $g->only(['ref', 'title', 'from_year', 'to_year']));
++
++        return redirect()->route('strategic-goals.show', $g)->with('ok', 'أُنشئ الهدف الاستراتيجي ' . $g->ref . '.');
++    }
++
++    public function update(Request $r, StrategicGoal $goal)
++    {
++        $this->guardManage();
++        $d = $r->validate($this->rules(), [], self::LABELS);
++        $old = $goal->only(array_keys($d));
++        $goal->update($d);
++        $changed = array_keys(array_diff_assoc(array_map('strval', $goal->only(array_keys($d))), array_map('strval', $old)));
++        if ($changed) {
++            Audit::log('strategic_goal.update', $goal, array_intersect_key($old, array_flip($changed)), $goal->only($changed));
++        }
++
++        return back()->with('ok', 'حُفظ الهدف الاستراتيجي.');
++    }
++
++    /** أرشفة (لا يظهر للربط الجديد ويبقى مرتبطًا بما سبق) أو إعادة تفعيل */
++    public function status(Request $r, StrategicGoal $goal)
++    {
++        $this->guardManage();
++        $d = $r->validate(['status' => 'required|in:active,archived']);
++        $old = $goal->status;
++        $goal->update(['status' => $d['status']]);
++        Audit::log('strategic_goal.' . ($d['status'] === 'archived' ? 'archive' : 'restore'), $goal, ['status' => $old], ['status' => $goal->status]);
++
++        return back()->with('ok', $d['status'] === 'archived' ? 'أُرشف الهدف؛ تبقى الروابط السابقة كما هي ولا يظهر للربط الجديد.' : 'أُعيد تفعيل الهدف.');
++    }
++
++    /** الحذف مسموح فقط لهدف لم يُربط بأي هدف خطة؛ وإلا يُؤرشف */
++    public function destroy(StrategicGoal $goal)
++    {
++        $this->guardManage();
++        abort_if(Objective::where('strategic_goal_id', $goal->id)->exists(), 422, 'الهدف مرتبط بأهداف خطط؛ استخدم الأرشفة بدل الحذف.');
++        Audit::log('strategic_goal.delete', $goal, $goal->only(['ref', 'title', 'description', 'from_year', 'to_year', 'status']), null);
++        $goal->delete();
++
++        return redirect()->route('strategic-goals.index')->with('ok', 'حُذف الهدف الاستراتيجي (رقمه المرجعي لن يُعاد استخدامه).');
++    }
++}
+diff --git a/app/Http/Controllers/WorkflowController.php b/app/Http/Controllers/WorkflowController.php
+index f44bb8b..fc5a8c8 100644
+--- a/app/Http/Controllers/WorkflowController.php
++++ b/app/Http/Controllers/WorkflowController.php
+@@ -14,7 +14,7 @@ class WorkflowController extends Controller
+     public function review(Plan $plan)
+     {
+         $this->canView($plan);
+-        $plan->load(['position', 'year.quarters', 'owner', 'objectives.indicators.targets', 'objectives.indicators.owner', 'projects.tasks']);
++        $plan->load(['position', 'year.quarters', 'owner', 'objectives.indicators.targets', 'objectives.indicators.owner', 'objectives.strategicGoal', 'projects.tasks']);
+         $errors_list = (new PlanValidator())->errors($plan);
+         $actions = app(PlanWorkflow::class)->availableActions(auth()->user(), $plan);
+         $reviews = $plan->reviews()->with(['user', 'delegation'])->get();
+diff --git a/app/Services/ChangeRequestService.php b/app/Services/ChangeRequestService.php
+index c6e050e..f3fbbb8 100644
+--- a/app/Services/ChangeRequestService.php
++++ b/app/Services/ChangeRequestService.php
+@@ -26,7 +26,7 @@
+ class ChangeRequestService
+ {
+     public const EDITABLE = [
+-        'objective' => ['title' => 'عنوان الهدف', 'weight' => 'وزن الهدف'],
++        'objective' => ['title' => 'عنوان الهدف', 'weight' => 'وزن الهدف', 'strategic_goal_id' => 'الهدف الاستراتيجي'],
+         'indicator' => ['annual_target' => 'المستهدف السنوي', 'weight' => 'وزن المؤشر', 'baseline' => 'خط الأساس', 'data_source' => 'مصدر البيانات'],
+         'target' => ['target' => 'مستهدف الربع'],
+     ];
+@@ -47,7 +47,17 @@ public function buildChanges(Plan $plan, array $input): array
+             foreach ($fields as $f => $new) {
+                 if (! isset(self::EDITABLE['objective'][$f]) || $new === null || $new === '') continue;
+                 if ((string) $o->$f !== (string) $new && ! (is_numeric($new) && (float) $o->$f == (float) $new)) {
+-                    $changes[] = ['entity' => 'objective', 'id' => $o->id, 'field' => $f, 'label' => self::EDITABLE['objective'][$f] . ' — ' . $o->title, 'old' => $o->$f, 'new' => $new];
++                    $c = ['entity' => 'objective', 'id' => $o->id, 'field' => $f, 'label' => self::EDITABLE['objective'][$f] . ' — ' . $o->title, 'old' => $o->$f, 'new' => $new];
++                    if ($f === 'strategic_goal_id') {
++                        $goal = \App\Models\StrategicGoal::whereKey((int) $new)->usableFor($plan->year->year)->first();
++                        if (! $goal) {
++                            throw ValidationException::withMessages(['changes' => 'الهدف الاستراتيجي المختار مؤرشف أو لا يغطي سنة الخطة.']);
++                        }
++                        $c['new'] = $goal->id;
++                        $c['old_label'] = $o->strategicGoal?->label() ?? 'غير مرتبط';
++                        $c['new_label'] = $goal->label();
++                    }
++                    $changes[] = $c;
+                 }
+             }
+         }
+@@ -121,7 +131,7 @@ public function simulate(Plan $plan, array $changes): array
+         DB::beginTransaction();
+         try {
+             $this->applyChanges($changes);
+-            $errors = (new PlanValidator())->errors($plan->fresh());
++            $errors = (new PlanValidator())->errors($plan->fresh(), false);
+         } finally {
+             DB::rollBack();
+         }
+diff --git a/app/Services/Export/ExportService.php b/app/Services/Export/ExportService.php
+index 58cce28..f5f8d51 100644
+--- a/app/Services/Export/ExportService.php
++++ b/app/Services/Export/ExportService.php
+@@ -197,7 +197,8 @@ private function planBlocks(Plan $plan, ?int $q): array
+         ];
+         $qs = $q ? [$q] : [1, 2, 3, 4];
+         foreach ($s['objectives'] as $n => $o) {
+-            $b[] = ['h3', ($n + 1) . '. ' . $o['title'] . ' — الوزن ' . Fmt::num($o['weight']) . '%'];
++            $b[] = ['h3', ($o['ref'] ? $o['ref'] . ' ' : ($n + 1) . '. ') . $o['title'] . ' — الوزن ' . Fmt::num($o['weight']) . '%'];
++            $b[] = ['p', 'الهدف الاستراتيجي: ' . ($o['strategic_goal'] ?? 'غير مرتبط')];
+             if ($o['description']) $b[] = ['p', $o['description']];
+             $b[] = ['table', ['المؤشر', 'التعريف', 'الوحدة', 'النوع', 'اتجاه التحسن', 'طريقة التجميع', 'الوزن داخل الهدف', 'مصدر البيانات', 'طريقة التحقق', 'الدورية', 'المالك'],
+                 array_map(fn ($i) => [$i['name'], $i['definition'], $i['unit'], $i['kind'], $i['direction'], $i['aggregation'], $i['weight'] !== null ? Fmt::num($i['weight']) . '%' : 'متساوٍ', $i['data_source'], $i['verification'], $i['frequency'], $i['owner']], $o['indicators']), 'wide'];
+@@ -222,7 +223,7 @@ private function planBlocks(Plan $plan, ?int $q): array
+         $rows = [];
+         foreach ($s['projects'] as $p) {
+             foreach ($p['tasks'] ?: [['title' => '—', 'quarter' => null, 'original_quarter' => null, 'responsible' => null, 'due_on' => '—', 'evidence' => null, 'status' => '—']] as $t) {
+-                $rows[] = [$p['type'] . ': ' . $p['name'], $p['starts_on'] . ' ← ' . $p['ends_on'], $t['title'],
++                $rows[] = [trim(($p['ref'] ?? '') . ' ' . $p['type'] . ': ' . $p['name']) . (! empty($p['parent_ref']) ? ' (ضمن ' . $p['parent_ref'] . ')' : '') . (! empty($p['owner']) ? ' — المسؤول: ' . $p['owner'] : ''), $p['starts_on'] . ' ← ' . $p['ends_on'], $t['title'],
+                     $t['quarter'] ? ('ر' . $t['quarter'] . ($t['original_quarter'] != $t['quarter'] ? ' (أصلًا ر' . $t['original_quarter'] . ')' : '')) : '—',
+                     $t['responsible'] ?? $p['responsible'], $t['due_on'], $t['evidence'], $t['status']];
+             }
+@@ -352,12 +353,12 @@ private function indicatorBlocks(Plan $plan, Indicator $ind, int $q): array
+ 
+     private function projectBlocks(Project $p): array
+     {
+-        $p->load(['tasks.deferrals', 'objective']);
++        $p->load(['tasks.deferrals', 'objective', 'parent']);
+ 
+-        return [['h2', $p->typeLabel() . ': ' . $p->name],
++        return [['h2', $p->ref . ' ' . $p->typeLabel() . ': ' . $p->name . ($p->parent ? ' (ضمن ' . $p->parent->ref . ')' : '')],
+             ['kv', [['الهدف المرتبط', $p->objective?->title ?? '—'], ['الوصف', $p->description], ['المسؤول', $p->responsible], ['المدة', Fmt::date($p->starts_on) . ' ← ' . Fmt::date($p->ends_on)], ['الموارد', $p->resources]]],
+-            ['table', ['المهمة', 'الربع الأصلي', 'الربع الحالي', 'المسؤول', 'الموعد', 'الحالة', 'سجل النقل'],
+-                $p->tasks->map(fn ($t) => [$t->title, 'ر' . $t->original_quarter, 'ر' . $t->quarter, $t->responsible, Fmt::date($t->due_on), $t->statusLabel(),
++            ['table', ['الرقم', 'المهمة', 'الربع الأصلي', 'الربع الحالي', 'المسؤول', 'الموعد', 'الحالة', 'سجل النقل'],
++                $p->tasks->map(fn ($t) => [$t->ref, $t->title, 'ر' . $t->original_quarter, 'ر' . $t->quarter, $t->responsible, Fmt::date($t->due_on), $t->statusLabel(),
+                     $t->deferrals->map(fn ($d) => 'ر' . $d->from_quarter . '←ر' . $d->to_quarter . ': ' . $d->reason)->implode(' | ')])->all()]];
+     }
+ 
+diff --git a/app/Services/Export/ReportBuilder.php b/app/Services/Export/ReportBuilder.php
+index 3f1cb30..267edcf 100644
+--- a/app/Services/Export/ReportBuilder.php
++++ b/app/Services/Export/ReportBuilder.php
+@@ -49,7 +49,7 @@ public function header(string $scope, ?Plan $plan, PlanningYear $year, ?int $qua
+ 
+     public function planStructure(Plan $plan, ?int $onlyQuarter = null): array
+     {
+-        $plan->load(['objectives.indicators.targets', 'objectives.indicators.owner', 'projects.tasks.deferrals', 'owner', 'reviews.user']);
++        $plan->load(['objectives.strategicGoal', 'objectives.indicators.targets', 'objectives.indicators.owner', 'projects.tasks.deferrals', 'projects.parent', 'projects.owner', 'owner', 'reviews.user']);
+         $objectives = [];
+         foreach ($plan->objectives as $o) {
+             $inds = [];
+@@ -70,10 +70,10 @@ public function planStructure(Plan $plan, ?int $onlyQuarter = null): array
+                     'frequency' => Indicator::FREQUENCIES[$i->frequency] ?? '—', 'owner' => $i->owner?->name, 'evidence' => $i->required_evidence,
+                 ];
+             }
+-            $objectives[] = ['title' => $o->title, 'description' => $o->description, 'weight' => $o->weight, 'indicators' => $inds];
++            $objectives[] = ['ref' => $o->ref, 'strategic_goal' => $o->strategicGoal?->label(), 'title' => $o->title, 'description' => $o->description, 'weight' => $o->weight, 'indicators' => $inds];
+         }
+         $projects = $plan->projects->map(fn (Project $p) => [
+-            'type' => $p->typeLabel(), 'name' => $p->name, 'responsible' => $p->responsible, 'starts_on' => Fmt::date($p->starts_on), 'ends_on' => Fmt::date($p->ends_on),
++            'ref' => $p->ref, 'parent_ref' => $p->parent?->ref, 'owner' => $p->owner?->name, 'type' => $p->typeLabel(), 'name' => $p->name, 'responsible' => $p->responsible, 'starts_on' => Fmt::date($p->starts_on), 'ends_on' => Fmt::date($p->ends_on),
+             'tasks' => $p->tasks->filter(fn ($t) => ! $onlyQuarter || $t->quarter == $onlyQuarter || $t->deferrals->contains('from_quarter', $onlyQuarter))
+                 ->map(fn ($t) => ['title' => $t->title, 'quarter' => $t->quarter, 'original_quarter' => $t->original_quarter, 'responsible' => $t->responsible,
+                     'due_on' => Fmt::date($t->due_on), 'evidence' => $t->required_evidence, 'status' => $t->statusLabel()])->values()->all(),
+diff --git a/app/Services/PlanSnapshot.php b/app/Services/PlanSnapshot.php
+index 3ff12c5..2c52267 100644
+--- a/app/Services/PlanSnapshot.php
++++ b/app/Services/PlanSnapshot.php
+@@ -9,21 +9,21 @@ class PlanSnapshot
+     /** لقطة كاملة لهيكل الخطة (بدون إنجاز) تُحفظ مع كل نسخة معتمدة */
+     public static function make(Plan $plan): array
+     {
+-        $plan->load(['objectives.indicators.targets', 'projects.tasks', 'position', 'year', 'owner']);
++        $plan->load(['objectives.strategicGoal', 'objectives.indicators.targets', 'projects.tasks', 'position', 'year', 'owner']);
+ 
+         return [
+-            'plan' => $plan->only(['id', 'scope_description', 'overall_outcome', 'risks', 'resources', 'status']),
++            'plan' => $plan->only(['id', 'ref', 'scope_description', 'overall_outcome', 'risks', 'resources', 'status']),
+             'position' => $plan->position->name,
+             'year' => $plan->year->year,
+             'owner' => $plan->owner?->name,
+             'objectives' => $plan->objectives->map(fn ($o) => [
+-                'id' => $o->id, 'title' => $o->title, 'description' => $o->description, 'weight' => $o->weight,
++                'id' => $o->id, 'ref' => $o->ref, 'strategic_goal_id' => $o->strategic_goal_id, 'strategic_goal' => $o->strategicGoal?->label(), 'title' => $o->title, 'description' => $o->description, 'weight' => $o->weight,
+                 'indicators' => $o->indicators->map(fn ($i) => $i->only([
+                     'id', 'name', 'definition', 'unit', 'direction', 'range_min', 'range_max', 'kind', 'aggregation', 'baseline',
+                     'annual_target', 'data_source', 'verification_method', 'frequency', 'required_evidence', 'owner_user_id', 'weight',
+                 ]) + ['targets' => $i->targets->pluck('target', 'quarter')->all()])->all(),
+             ])->all(),
+-            'projects' => $plan->projects->map(fn ($p) => $p->only(['id', 'type', 'name', 'description', 'responsible', 'starts_on', 'ends_on', 'objective_id'])
++            'projects' => $plan->projects->map(fn ($p) => $p->only(['id', 'ref', 'parent_id', 'type', 'name', 'description', 'responsible', 'starts_on', 'ends_on', 'objective_id'])
+                 + ['tasks' => $p->tasks->map(fn ($t) => $t->only(['id', 'title', 'responsible', 'quarter', 'due_on', 'required_evidence']))->all()])->all(),
+             'loose_tasks' => $plan->tasks()->whereNull('project_id')->get()->map(fn ($t) => $t->only(['id', 'title', 'responsible', 'quarter', 'due_on']))->all(),
+         ];
+diff --git a/app/Services/PlanValidator.php b/app/Services/PlanValidator.php
+index 43b303b..5c81d25 100644
+--- a/app/Services/PlanValidator.php
++++ b/app/Services/PlanValidator.php
+@@ -12,8 +12,12 @@ class PlanValidator
+ {
+     public const TOLERANCE = 0.01;
+ 
+-    /** @return array<int, array{field:string, message:string, url:?string}> */
+-    public function errors(Plan $plan): array
++    /**
++     * @param  bool  $requireStrategicLinks  يُفرض الربط بالأهداف الاستراتيجية عند الإعداد والإرسال فقط؛
++     *                                        لا يُفرض عند الاعتماد أو محاكاة طلبات التعديل حتى لا تتعطل خطط قائمة.
++     * @return array<int, array{field:string, message:string, url:?string}>
++     */
++    public function errors(Plan $plan, bool $requireStrategicLinks = true): array
+     {
+         $plan->load(['objectives.indicators.targets']);
+         $e = [];
+@@ -43,6 +47,16 @@ public function errors(Plan $plan): array
+             $add('objectives.weight_sum', 'مجموع أوزان الأهداف يجب أن يساوي 100%، والمجموع الحالي ' . Fmt::num($sum) . '%.', $editUrl);
+         }
+ 
++        // الربط بالأهداف الاستراتيجية: إلزامي متى وُجدت أهداف استراتيجية فعّالة تغطي سنة الخطة
++        $plan->loadMissing('year');
++        if ($requireStrategicLinks && \App\Models\StrategicGoal::usableFor($plan->year->year)->exists()) {
++            foreach ($plan->objectives as $o) {
++                if (! $o->strategic_goal_id) {
++                    $add("objectives.{$o->id}.strategic_goal_id", "اربط الهدف «{$o->title}» بهدف استراتيجي من أهداف الجمعية.", $editUrl . '#obj-' . $o->id);
++                }
++            }
++        }
++
+         foreach ($plan->objectives as $o) {
+             if ($o->indicators->isEmpty()) {
+                 $add("objectives.{$o->id}.indicators", "الهدف «{$o->title}» لا يحتوي مؤشرًا قابلًا للقياس. أضف مؤشرًا واحدًا على الأقل.", route('indicators.create', [$plan, 'objective' => $o->id]));
+diff --git a/app/Services/PlanWorkflow.php b/app/Services/PlanWorkflow.php
+index 2c14db0..6be4311 100644
+--- a/app/Services/PlanWorkflow.php
++++ b/app/Services/PlanWorkflow.php
+@@ -60,7 +60,7 @@ public function apply(User $u, Plan $p, string $action, ?string $note = null): P
+         if ($action === 'submit' && ($errors = (new PlanValidator())->errors($p))) {
+             throw ValidationException::withMessages(['plan' => array_column($errors, 'message')]);
+         }
+-        if ($action === 'approve' && ($errors = (new PlanValidator())->errors($p))) {
++        if ($action === 'approve' && ($errors = (new PlanValidator())->errors($p, false))) {
+             throw ValidationException::withMessages(['plan' => array_column($errors, 'message')]);
+         }
+ 
+diff --git a/app/Support/Access.php b/app/Support/Access.php
+index 283a4bc..1faffed 100644
+--- a/app/Support/Access.php
++++ b/app/Support/Access.php
+@@ -112,6 +112,11 @@ public static function canManageExecutive(User $u): bool { return self::canManag
+ 
+     public static function canManageYears(User $u): bool { return $u->is_active && (self::isPlanning($u) || self::isPresident($u)); }
+ 
++    /** الأهداف الاستراتيجية: يديرها الرئيس ومسؤولة التخطيط (بموافقة مالك النظام)، ويطّلع عليها كل صاحب منصب */
++    public static function canManageStrategicGoals(User $u): bool { return $u->is_active && (self::isPresident($u) || self::isPlanning($u)); }
++
++    public static function canSeeStrategicGoals(User $u): bool { return $u->is_active && (self::positions($u)->isNotEmpty() || self::hasGlobalView($u)); }
++
+     public static function canSeeExecutiveBoard(User $u): bool { return self::hasGlobalView($u); }
+ 
+     public static function canSeeAudit(User $u): bool { return self::hasGlobalView($u) || $u->is_system_admin; }
+diff --git a/resources/views/change-requests/create.blade.php b/resources/views/change-requests/create.blade.php
+index 0d38f29..167c585 100644
+--- a/resources/views/change-requests/create.blade.php
++++ b/resources/views/change-requests/create.blade.php
+@@ -22,6 +22,12 @@
+                 <div class="form-grid g4">
+                     <div class="field" style="grid-column: span 3"><label class="f">عنوان الهدف</label><input type="text" name="objectives[{{ $o->id }}][title]" value="{{ old('objectives.' . $o->id . '.title', $o->title) }}"></div>
+                     <div class="field"><label class="f">وزن الهدف % <span class="muted">(الحالي {{ Fmt::num($o->weight) }})</span></label><input type="number" step="0.01" name="objectives[{{ $o->id }}][weight]" value="{{ old('objectives.' . $o->id . '.weight', $o->weight) }}"></div>
++                    <div class="field full"><label class="f">الهدف الاستراتيجي</label>
++                        <select name="objectives[{{ $o->id }}][strategic_goal_id]">
++                            @if (! $o->strategic_goal_id)<option value="">— غير مرتبط —</option>@endif
++                            @foreach ($goals as $g)<option value="{{ $g->id }}" @selected(old('objectives.' . $o->id . '.strategic_goal_id', $o->strategic_goal_id) == $g->id)>{{ $g->label() }}</option>@endforeach
++                            @if ($o->strategicGoal && ! $goals->contains('id', $o->strategic_goal_id))<option value="{{ $o->strategic_goal_id }}" selected>{{ $o->strategicGoal->label() }} (مؤرشف)</option>@endif
++                        </select></div>
+                 </div>
+                 <div class="table-wrap"><table class="t">
+                     <thead><tr><th>المؤشر</th><th>خط الأساس</th><th>المستهدف السنوي</th>@for ($k = 1; $k <= 4; $k++)<th>ر{{ $k }}@if (in_array($k, $closed)) 🔒@endif</th>@endfor<th>الوزن</th><th>مصدر البيانات</th></tr></thead>
+diff --git a/resources/views/change-requests/show.blade.php b/resources/views/change-requests/show.blade.php
+index 368f573..9ee10d5 100644
+--- a/resources/views/change-requests/show.blade.php
++++ b/resources/views/change-requests/show.blade.php
+@@ -27,8 +27,8 @@
+                 @foreach ($cr->changes as $c)
+                     <tr>
+                         <td>{{ $c['label'] }}</td>
+-                        <td><span class="diff-old">{{ is_numeric($c['old']) ? Fmt::num($c['old']) : ($c['old'] ?? '—') }}</span></td>
+-                        <td><span class="diff-new">{{ is_numeric($c['new']) ? Fmt::num($c['new']) : $c['new'] }}</span>@if (! empty($c['participants'])) <span class="small muted">({{ $c['participants'] }} مشاركًا)</span>@endif</td>
++                        <td><span class="diff-old">{{ $c['old_label'] ?? (is_numeric($c['old']) ? Fmt::num($c['old']) : ($c['old'] ?? '—')) }}</span></td>
++                        <td><span class="diff-new">{{ $c['new_label'] ?? (is_numeric($c['new']) ? Fmt::num($c['new']) : $c['new']) }}</span>@if (! empty($c['participants'])) <span class="small muted">({{ $c['participants'] }} مشاركًا)</span>@endif</td>
+                     </tr>
+                 @endforeach
+                 </tbody>
+diff --git a/resources/views/layouts/app.blade.php b/resources/views/layouts/app.blade.php
+index 0de851f..25fae02 100644
+--- a/resources/views/layouts/app.blade.php
++++ b/resources/views/layouts/app.blade.php
+@@ -59,6 +59,9 @@
+         @if ($hasPlans)
+             <a class="nav {{ $on('plans.', 'objectives.', 'indicators.', 'projects.') }}" href="{{ route('plans.index') }}">{{ Access::hasGlobalView($u) ? 'جميع الخطط' : 'خطتي' }}</a>
+         @endif
++        @if (Access::canSeeStrategicGoals($u))
++            <a class="nav {{ $on('strategic-goals.') }}" href="{{ route('strategic-goals.index') }}">الأهداف الاستراتيجية</a>
++        @endif
+ 
+         @if ($isReviewer || Access::canSeeExecutiveBoard($u))
+             <div class="grp">المتابعة الشاملة</div>
+diff --git a/resources/views/plans/_activity-fields.blade.php b/resources/views/plans/_activity-fields.blade.php
+new file mode 100644
+index 0000000..d8f09b0
+--- /dev/null
++++ b/resources/views/plans/_activity-fields.blade.php
+@@ -0,0 +1,12 @@
++{{-- حقول النشاط: $a (Project|null), $parent (المبادرة الأم) --}}
++<input type="hidden" name="type" value="activity">
++<input type="hidden" name="parent_id" value="{{ $parent->id }}">
++<div class="form-grid g3">
++    <div class="field" style="grid-column: span 2"><label class="f">اسم النشاط</label><input type="text" name="name" value="{{ $a->name ?? '' }}" required></div>
++    <div class="field"><label class="f">المسؤول عن النشاط</label>
++        <select name="owner_user_id"><option value="">—</option>@foreach ($users as $x)<option value="{{ $x->id }}" @selected(($a->owner_user_id ?? auth()->id()) == $x->id)>{{ $x->name }}</option>@endforeach</select></div>
++    <div class="field"><label class="f">الجهة/الشخص المنفذ (نص)</label><input type="text" name="responsible" value="{{ $a->responsible ?? '' }}"></div>
++    <div class="field"><label class="f">تاريخ البدء</label><input type="date" name="starts_on" value="{{ $a?->starts_on?->toDateString() }}"></div>
++    <div class="field"><label class="f">تاريخ الانتهاء</label><input type="date" name="ends_on" value="{{ $a?->ends_on?->toDateString() }}"></div>
++    <div class="field full"><label class="f">الوصف والمخرج المتوقع</label><textarea name="description" rows="2">{{ $a->description ?? '' }}</textarea></div>
++</div>
+diff --git a/resources/views/plans/_project-fields.blade.php b/resources/views/plans/_project-fields.blade.php
+index e97c370..ebcbd59 100644
+--- a/resources/views/plans/_project-fields.blade.php
++++ b/resources/views/plans/_project-fields.blade.php
+@@ -4,8 +4,8 @@
+     <div class="field" style="grid-column: span 2"><label class="f">الاسم</label><input type="text" name="name" value="{{ $p->name ?? '' }}" required></div>
+     <div class="field"><label class="f">الهدف المرتبط</label>
+         <select name="objective_id"><option value="">—</option>@foreach ($plan->objectives as $o)<option value="{{ $o->id }}" @selected(($p->objective_id ?? null) == $o->id)>{{ $o->title }}</option>@endforeach</select></div>
+-    <div class="field"><label class="f">المسؤول</label><input type="text" name="responsible" value="{{ $p->responsible ?? auth()->user()->name }}"></div>
+-    <div class="field"><label class="f">المالك في النظام</label>
++    <div class="field"><label class="f">الجهة/الشخص المنفذ (نص)</label><input type="text" name="responsible" value="{{ $p->responsible ?? auth()->user()->name }}"></div>
++    <div class="field"><label class="f">المسؤول (حساب في النظام)</label>
+         <select name="owner_user_id"><option value="">—</option>@foreach ($users as $x)<option value="{{ $x->id }}" @selected(($p->owner_user_id ?? auth()->id()) == $x->id)>{{ $x->name }}</option>@endforeach</select></div>
+     <div class="field"><label class="f">تاريخ البدء</label><input type="date" name="starts_on" value="{{ $p?->starts_on?->toDateString() }}"></div>
+     <div class="field"><label class="f">تاريخ الانتهاء</label><input type="date" name="ends_on" value="{{ $p?->ends_on?->toDateString() }}"></div>
+diff --git a/resources/views/plans/_task-fields.blade.php b/resources/views/plans/_task-fields.blade.php
+index 90255d8..74fa6fe 100644
+--- a/resources/views/plans/_task-fields.blade.php
++++ b/resources/views/plans/_task-fields.blade.php
+@@ -3,8 +3,8 @@
+     <div class="field" style="grid-column: span 2"><label class="f">عنوان المهمة</label><input type="text" name="title" value="{{ $t->title ?? '' }}" required></div>
+     <div class="field"><label class="f">الربع</label>
+         <select name="quarter">@for ($k = 1; $k <= 4; $k++)<option value="{{ $k }}" @selected(($t->quarter ?? 1) == $k)>{{ \App\Support\Workspace::quarterName($k) }}</option>@endfor</select></div>
+-    <div class="field"><label class="f">المسؤول</label><input type="text" name="responsible" value="{{ $t->responsible ?? auth()->user()->name }}"></div>
+-    <div class="field"><label class="f">المالك في النظام</label>
++    <div class="field"><label class="f">الجهة/الشخص المنفذ (نص)</label><input type="text" name="responsible" value="{{ $t->responsible ?? auth()->user()->name }}"></div>
++    <div class="field"><label class="f">المسؤول (حساب في النظام)</label>
+         <select name="owner_user_id"><option value="">—</option>@foreach ($users as $x)<option value="{{ $x->id }}" @selected(($t->owner_user_id ?? auth()->id()) == $x->id)>{{ $x->name }}</option>@endforeach</select></div>
+     <div class="field"><label class="f">الموعد</label><input type="date" name="due_on" value="{{ $t?->due_on?->toDateString() }}"></div>
+     <div class="field full"><label class="f">الدليل المطلوب لإثبات الإنجاز</label><input type="text" name="required_evidence" value="{{ $t->required_evidence ?? '' }}"></div>
+diff --git a/resources/views/plans/_tasks-editor.blade.php b/resources/views/plans/_tasks-editor.blade.php
+new file mode 100644
+index 0000000..d7e3993
+--- /dev/null
++++ b/resources/views/plans/_tasks-editor.blade.php
+@@ -0,0 +1,18 @@
++{{-- مهام مبادرة أو نشاط: $holder (Project) --}}
++@php use App\Support\Fmt; @endphp
++@foreach ($holder->tasks as $t)
++    <details class="box"><summary class="small"><span class="num muted">{{ $t->ref }}</span> ر{{ $t->quarter }} — {{ $t->title }} <span class="muted">{{ Fmt::date($t->due_on) }}{{ $t->owner ? ' · ' . $t->owner->name : '' }}</span></summary>
++        <div class="in">
++            <form method="post" action="{{ route('tasks.update', $t) }}">@csrf @method('put')
++                @include('plans._task-fields', ['t' => $t, 'projectId' => $holder->id])
++                <button class="btn sec sm">حفظ المهمة</button>
++            </form>
++            <form method="post" action="{{ route('tasks.destroy', $t) }}" style="margin-top:.4rem">@csrf @method('delete')<button class="btn danger sm" data-confirm="حذف المهمة {{ $t->ref }}؟">حذف</button></form>
++        </div>
++    </details>
++@endforeach
++<form method="post" action="{{ route('tasks.store', $plan) }}" class="card" style="background:var(--bg);box-shadow:none;margin-top:.5rem">@csrf
++    <h3>+ مهمة جديدة ضمن {{ $holder->ref }}</h3>
++    @include('plans._task-fields', ['t' => null, 'projectId' => $holder->id])
++    <button class="btn sm">إضافة المهمة</button>
++</form>
+diff --git a/resources/views/plans/edit.blade.php b/resources/views/plans/edit.blade.php
+index 896407b..dbef2bb 100644
+--- a/resources/views/plans/edit.blade.php
++++ b/resources/views/plans/edit.blade.php
+@@ -35,7 +35,8 @@
+     @foreach ($plan->objectives as $o)
+         @php $iw = $o->indicators->whereNotNull('weight'); $isum = $o->indicators->sum('weight'); @endphp
+         <details class="box" id="obj-{{ $o->id }}" open>
+-            <summary>{{ $loop->iteration }}. {{ $o->title }} <span class="small muted">— الوزن {{ Fmt::num($o->weight) }}%</span>
++            <summary><span class="num small muted">{{ $o->ref }}</span> {{ $o->title }} <span class="small muted">— الوزن {{ Fmt::num($o->weight) }}%</span>
++                @if ($o->strategicGoal)<span class="badge info">{{ $o->strategicGoal->ref }}</span>@elseif ($goals->isNotEmpty())<span class="badge warn">غير مرتبط بهدف استراتيجي</span>@endif
+                 @if ($o->indicators->isEmpty())<span class="badge warn">بلا مؤشر</span>@endif
+                 @if ($iw->isNotEmpty())<span class="badge {{ abs($isum - 100) < 0.01 && $iw->count() === $o->indicators->count() ? 'ok' : 'warn' }}">أوزان المؤشرات {{ Fmt::num($isum) }}%</span>@endif
+             </summary>
+@@ -46,6 +47,14 @@
+                         <div class="field"><label class="f">الوزن %</label><input type="number" step="0.01" min="0" max="100" name="weight" value="{{ $o->weight }}"></div>
+                         <div class="field" style="align-self:end"><button class="btn sec sm">حفظ الهدف</button></div>
+                         <div class="field full"><label class="f">وصف الهدف</label><textarea name="description" rows="2">{{ $o->description }}</textarea></div>
++                        <div class="field full"><label class="f">الهدف الاستراتيجي للجمعية</label>
++                            <select name="strategic_goal_id">
++                                <option value="">— غير مرتبط —</option>
++                                @foreach ($goals as $g)<option value="{{ $g->id }}" @selected($o->strategic_goal_id == $g->id)>{{ $g->label() }}</option>@endforeach
++                                @if ($o->strategicGoal && ! $goals->contains('id', $o->strategic_goal_id))<option value="{{ $o->strategic_goal_id }}" selected>{{ $o->strategicGoal->label() }} (مؤرشف)</option>@endif
++                            </select>
++                            @if ($goals->isEmpty())<div class="hint">لا توجد أهداف استراتيجية فعّالة لسنة الخطة بعد؛ يضيفها الرئيس أو مسؤولة التخطيط من «الأهداف الاستراتيجية».</div>@endif
++                        </div>
+                     </div>
+                 </form>
+ 
+@@ -86,38 +95,55 @@
+             <div class="field"><label class="f">الوزن %</label><input type="number" step="0.01" min="0" max="100" name="weight" value="{{ max(0, 100 - $wsum) ?: '' }}"></div>
+             <div class="field" style="align-self:end"><button class="btn sm">إضافة الهدف</button></div>
+             <div class="field full"><label class="f">وصف الهدف</label><textarea name="description" rows="2"></textarea></div>
++                        <div class="field full"><label class="f">الهدف الاستراتيجي للجمعية</label>
++                            <select name="strategic_goal_id">
++                                <option value="">— غير مرتبط —</option>
++                                @foreach ($goals as $g)<option value="{{ $g->id }}" @selected(old('strategic_goal_id') == $g->id)>{{ $g->label() }}</option>@endforeach
++                                
++                            </select>
++                            @if ($goals->isEmpty())<div class="hint">لا توجد أهداف استراتيجية فعّالة لسنة الخطة بعد؛ يضيفها الرئيس أو مسؤولة التخطيط من «الأهداف الاستراتيجية».</div>@endif
++                        </div>
+         </div>
+     </form>
+ </div>
+ 
+ <div class="card" id="projects">
+-    <h2>3. المبادرات والمشاريع والمهام</h2>
+-    @foreach ($plan->projects as $p)
++    <h2>3. المبادرات والأنشطة والمهام</h2>
++    <p class="small muted">التسلسل: مبادرة أو مشروع ← أنشطة ← مهام، ولكل مستوى مسؤول. تُعطى الأرقام المرجعية تلقائيًا ولا تتغير.</p>
++    @foreach ($plan->projects->whereNull('parent_id') as $p)
+         <details class="box">
+-            <summary>{{ $p->typeLabel() }}: {{ $p->name }} <span class="small muted">({{ $p->tasks()->count() }} مهمة)</span></summary>
++            <summary><span class="num small muted">{{ $p->ref }}</span> {{ $p->typeLabel() }}: {{ $p->name }}
++                <span class="small muted">({{ $p->activities->count() }} نشاط · {{ $p->tasks()->count() }} مهمة مباشرة{{ $p->owner ? ' · المسؤول: ' . $p->owner->name : '' }})</span></summary>
+             <div class="in">
+                 <form method="post" action="{{ route('projects.update', $p) }}">@csrf @method('put')
+                     @include('plans._project-fields', ['p' => $p])
+-                    <div class="row"><button class="btn sec sm">حفظ المشروع</button></div>
++                    <div class="row"><button class="btn sec sm">حفظ {{ $p->typeLabel() }}</button></div>
+                 </form>
+-                <form method="post" action="{{ route('projects.destroy', $p) }}" style="margin-top:.4rem">@csrf @method('delete')<button class="btn danger sm" data-confirm="حذف المشروع؟ تبقى مهامه دون مشروع.">حذف المشروع</button></form>
+-                <h3 style="margin-top:1rem">مهام المشروع</h3>
+-                @foreach ($p->tasks as $t)
+-                    <details class="box"><summary class="small">ر{{ $t->quarter }} — {{ $t->title }} <span class="muted">{{ Fmt::date($t->due_on) }}</span></summary>
++                <form method="post" action="{{ route('projects.destroy', $p) }}" style="margin-top:.4rem">@csrf @method('delete')<button class="btn danger sm" data-confirm="حذف {{ $p->typeLabel() }} {{ $p->ref }}؟ تبقى مهامه دون ارتباط.">حذف {{ $p->typeLabel() }}</button></form>
++
++                <h3 style="margin-top:1rem">الأنشطة</h3>
++                @foreach ($p->activities as $a)
++                    <details class="box">
++                        <summary class="small"><span class="num muted">{{ $a->ref }}</span> {{ $a->name }} <span class="muted">({{ $a->tasks()->count() }} مهمة{{ $a->owner ? ' · ' . $a->owner->name : '' }})</span></summary>
+                         <div class="in">
+-                            <form method="post" action="{{ route('tasks.update', $t) }}">@csrf @method('put')
+-                                @include('plans._task-fields', ['t' => $t, 'projectId' => $p->id])
+-                                <button class="btn sec sm">حفظ المهمة</button>
++                            <form method="post" action="{{ route('projects.update', $a) }}">@csrf @method('put')
++                                @include('plans._activity-fields', ['a' => $a, 'parent' => $p])
++                                <button class="btn sec sm">حفظ النشاط</button>
+                             </form>
+-                            <form method="post" action="{{ route('tasks.destroy', $t) }}" style="margin-top:.4rem">@csrf @method('delete')<button class="btn danger sm" data-confirm="حذف المهمة؟">حذف</button></form>
++                            <form method="post" action="{{ route('projects.destroy', $a) }}" style="margin-top:.4rem">@csrf @method('delete')<button class="btn danger sm" data-confirm="حذف النشاط {{ $a->ref }}؟ تبقى مهامه دون ارتباط.">حذف النشاط</button></form>
++                            <h3 style="margin-top:.8rem">مهام النشاط</h3>
++                            @include('plans._tasks-editor', ['holder' => $a])
+                         </div>
+                     </details>
+                 @endforeach
+-                <form method="post" action="{{ route('tasks.store', $plan) }}" class="card" style="background:var(--bg);box-shadow:none;margin-top:.5rem">@csrf
+-                    <h3>+ مهمة جديدة</h3>
+-                    @include('plans._task-fields', ['t' => null, 'projectId' => $p->id])
+-                    <button class="btn sm">إضافة المهمة</button>
++                <form method="post" action="{{ route('projects.store', $plan) }}" class="card" style="background:var(--bg);box-shadow:none;margin-top:.5rem">@csrf
++                    <h3>+ نشاط جديد ضمن {{ $p->ref }}</h3>
++                    @include('plans._activity-fields', ['a' => null, 'parent' => $p])
++                    <button class="btn sm">إضافة النشاط</button>
+                 </form>
++
++                <h3 style="margin-top:1rem">مهام مباشرة (دون نشاط)</h3>
++                @include('plans._tasks-editor', ['holder' => $p])
+             </div>
+         </details>
+     @endforeach
+diff --git a/resources/views/plans/index.blade.php b/resources/views/plans/index.blade.php
+index ffb166d..40b1fb1 100644
+--- a/resources/views/plans/index.blade.php
++++ b/resources/views/plans/index.blade.php
+@@ -20,10 +20,11 @@
+     </div>
+ @else
+     <div class="table-wrap"><table class="t">
+-        <thead><tr><th>المنصب</th><th>مالك الخطة</th><th>الحالة</th><th>النسخة</th><th>آخر تحديث</th><th></th></tr></thead>
++        <thead><tr><th>الرقم</th><th>المنصب</th><th>مالك الخطة</th><th>الحالة</th><th>النسخة</th><th>آخر تحديث</th><th></th></tr></thead>
+         <tbody>
+         @foreach ($plans as $p)
+             <tr>
++                <td class="n">{{ $p->ref }}</td>
+                 <td><a href="{{ route('plans.show', $p) }}"><b>{{ $p->position->name }}</b></a></td>
+                 <td>{{ $p->owner->name }}</td>
+                 <td><span class="badge {{ $p->status }}">{{ $p->statusLabel() }}</span></td>
+diff --git a/resources/views/plans/objective.blade.php b/resources/views/plans/objective.blade.php
+index 260d617..9bc2ca3 100644
+--- a/resources/views/plans/objective.blade.php
++++ b/resources/views/plans/objective.blade.php
+@@ -10,7 +10,13 @@
+     <a class="btn sec sm" href="{{ route('plans.show', [$plan, 'quarter' => $q]) }}">← الخطة</a>
+     <span class="right">@include('partials.download', ['scope' => 'objective', 'plan' => $plan, 'subject' => $objective->id, 'quarter' => $q, 'label' => 'نتيجة الهدف'])</span>
+ </div>
+-@if ($objective->description)<div class="card"><p>{!! nl2br(e($objective->description)) !!}</p></div>@endif
++<div class="card">
++    <table class="kv">
++        <tr><th>الرقم المرجعي</th><td class="num">{{ $objective->ref }}</td></tr>
++        <tr><th>الهدف الاستراتيجي</th><td>@if ($objective->strategicGoal)<a href="{{ route('strategic-goals.show', $objective->strategicGoal) }}">{{ $objective->strategicGoal->label() }}</a>@else<span class="muted">غير مرتبط</span>@endif</td></tr>
++        @if ($objective->description)<tr><th>الوصف</th><td>{!! nl2br(e($objective->description)) !!}</td></tr>@endif
++    </table>
++</div>
+ @if ($result)
+     @include('partials.results-table', ['results' => ['objectives' => [$result], 'quarter' => $q], 'downloadPlan' => null])
+     <div class="card">
+diff --git a/resources/views/plans/project.blade.php b/resources/views/plans/project.blade.php
+index 8598929..49bfb4a 100644
+--- a/resources/views/plans/project.blade.php
++++ b/resources/views/plans/project.blade.php
+@@ -1,41 +1,72 @@
+ @extends('layouts.app')
+-@section('title', $project->name)
++@section('title', $project->ref . ' — ' . $project->name)
+ @php use App\Support\Fmt; @endphp
+ @section('content')
+ <div class="ws-title">
+-    <h1>{{ $project->typeLabel() }}: {{ $project->name }}</h1>
++    <h1><span class="num">{{ $project->ref }}</span> {{ $project->typeLabel() }}: {{ $project->name }}</h1>
+     <span class="pill">{{ $plan->title() }}</span>
+ </div>
+ <div class="row" style="margin-bottom:1rem">
+     <a class="btn sec sm" href="{{ route('plans.show', [$plan, 'tab' => 'tasks']) }}">← مهام الخطة</a>
+-    <span class="right">@include('partials.download', ['scope' => 'project', 'plan' => $plan, 'subject' => $project->id, 'label' => 'المشروع ومهامه'])</span>
++    @if ($project->parent)<a class="btn sec sm" href="{{ route('projects.show', $project->parent) }}">↑ {{ $project->parent->typeLabel() }} {{ $project->parent->ref }}</a>@endif
++    <span class="right">@include('partials.download', ['scope' => 'project', 'plan' => $plan, 'subject' => $project->id, 'label' => $project->typeLabel() . ' ومهامه'])</span>
+ </div>
+ <div class="card">
+     <table class="kv">
+-        <tr><th>الهدف المرتبط</th><td>{{ $project->objective?->title ?? '—' }}</td></tr>
+-        <tr><th>الوصف</th><td>{{ $project->description ?? '—' }}</td></tr>
+-        <tr><th>المسؤول</th><td>{{ $project->responsible ?? '—' }}</td></tr>
++        <tr><th>الرقم المرجعي</th><td class="num">{{ $project->ref }}</td></tr>
++        @if ($project->parent)<tr><th>ضمن</th><td><a href="{{ route('projects.show', $project->parent) }}">{{ $project->parent->ref }} — {{ $project->parent->name }}</a></td></tr>@endif
++        <tr><th>الهدف المرتبط</th><td>@if ($project->objective){{ $project->objective->ref }} — {{ $project->objective->title }}@else — @endif</td></tr>
++        <tr><th>الهدف الاستراتيجي</th><td>{{ $project->objective?->strategicGoal?->label() ?? '—' }}</td></tr>
++        <tr><th>المسؤول</th><td>{{ $project->owner?->name ?? '—' }}@if ($project->responsible) <span class="muted small">(المنفذ: {{ $project->responsible }})</span>@endif</td></tr>
+         <tr><th>المدة</th><td><span class="num">{{ Fmt::date($project->starts_on) }}</span> – <span class="num">{{ Fmt::date($project->ends_on) }}</span></td></tr>
+-        <tr><th>الموارد</th><td>{{ $project->resources ?? '—' }}</td></tr>
++        <tr><th>الوصف</th><td>{{ $project->description ?? '—' }}</td></tr>
++        @if (! $project->isActivity())<tr><th>الموارد</th><td>{{ $project->resources ?? '—' }}</td></tr>@endif
+     </table>
+ </div>
++
++@if (! $project->isActivity())
++<div class="card">
++    <h2>الأنشطة ({{ $project->activities->count() }})</h2>
++    @if ($project->activities->isEmpty())
++        <p class="muted small">لا توجد أنشطة.</p>
++    @else
++        <div class="table-wrap"><table class="t">
++            <thead><tr><th>الرقم</th><th>النشاط</th><th>المسؤول</th><th>المدة</th><th>المهام</th><th>منجزة</th></tr></thead>
++            <tbody>
++            @foreach ($project->activities as $a)
++                <tr>
++                    <td class="n">{{ $a->ref }}</td>
++                    <td><a href="{{ route('projects.show', $a) }}">{{ $a->name }}</a></td>
++                    <td class="small">{{ $a->owner?->name ?? $a->responsible ?? '—' }}</td>
++                    <td class="small"><span class="num">{{ Fmt::date($a->starts_on) }}</span> – <span class="num">{{ Fmt::date($a->ends_on) }}</span></td>
++                    <td class="n">{{ $a->tasks->count() }}</td>
++                    <td class="n">{{ $a->tasks->where('status', 'done')->count() }}</td>
++                </tr>
++            @endforeach
++            </tbody>
++        </table></div>
++    @endif
++</div>
++@endif
++
+ <div class="card">
+-    <h2>المهام</h2>
++    <h2>{{ $project->isActivity() ? 'مهام النشاط' : 'المهام المباشرة' }}</h2>
+     <div class="table-wrap"><table class="t">
+-        <thead><tr><th>المهمة</th><th>الربع الأصلي</th><th>الربع الحالي</th><th>المسؤول</th><th>الموعد</th><th>الحالة</th><th>سجل النقل</th></tr></thead>
++        <thead><tr><th>الرقم</th><th>المهمة</th><th>الربع الأصلي</th><th>الربع الحالي</th><th>المسؤول</th><th>الموعد</th><th>الحالة</th><th>سجل النقل</th></tr></thead>
+         <tbody>
+         @forelse ($project->tasks as $t)
+             <tr>
++                <td class="n">{{ $t->ref }}</td>
+                 <td>{{ $t->title }}</td>
+                 <td>ر{{ $t->original_quarter }}</td>
+                 <td>ر{{ $t->quarter }}</td>
+-                <td class="small">{{ $t->responsible ?? $t->owner?->name }}</td>
++                <td class="small">{{ $t->owner?->name ?? $t->responsible ?? '—' }}</td>
+                 <td class="n">{{ Fmt::date($t->due_on) }}</td>
+                 <td><span class="badge {{ $t->status }}">{{ $t->statusLabel() }}</span>@if ($t->isOverdue())<span class="badge overdue">متأخرة</span>@endif</td>
+                 <td class="small">@foreach ($t->deferrals as $d)<div>ر{{ $d->from_quarter }} ← ر{{ $d->to_quarter }}: {{ $d->reason }}</div>@endforeach</td>
+             </tr>
+         @empty
+-            <tr><td colspan="7" class="muted">لا توجد مهام.</td></tr>
++            <tr><td colspan="8" class="muted">لا توجد مهام.</td></tr>
+         @endforelse
+         </tbody>
+     </table></div>
+diff --git a/resources/views/plans/review.blade.php b/resources/views/plans/review.blade.php
+index 7410054..39bee00 100644
+--- a/resources/views/plans/review.blade.php
++++ b/resources/views/plans/review.blade.php
+@@ -29,7 +29,8 @@
+                 <tr><th>الموارد</th><td>{!! nl2br(e($plan->resources ?: '—')) !!}</td></tr>
+             </table>
+             @foreach ($plan->objectives as $o)
+-                <h3 style="margin-top:1rem">{{ $loop->iteration }}. {{ $o->title }} — <span class="num">{{ Fmt::num($o->weight) }}%</span></h3>
++                <h3 style="margin-top:1rem"><span class="num">{{ $o->ref }}</span> {{ $o->title }} — <span class="num">{{ Fmt::num($o->weight) }}%</span></h3>
++                <p class="small">الهدف الاستراتيجي: @if ($o->strategicGoal)<a href="{{ route('strategic-goals.show', $o->strategicGoal) }}">{{ $o->strategicGoal->label() }}</a>@else<span class="muted">غير مرتبط</span>@endif</p>
+                 <div class="table-wrap"><table class="t">
+                     <thead><tr><th>المؤشر والتعريف</th><th>الوحدة / النوع / الاتجاه</th><th>خط الأساس</th><th>السنوي</th><th>ر1</th><th>ر2</th><th>ر3</th><th>ر4</th><th>المصدر والتحقق</th><th>الدورية / المالك</th></tr></thead>
+                     <tbody>
+diff --git a/resources/views/plans/tabs/overview.blade.php b/resources/views/plans/tabs/overview.blade.php
+index 6a53494..4c31d2a 100644
+--- a/resources/views/plans/tabs/overview.blade.php
++++ b/resources/views/plans/tabs/overview.blade.php
+@@ -3,7 +3,8 @@
+     <div class="card">
+         <h2>بيانات الخطة</h2>
+         <table class="kv">
+-            <tr><th>السنة</th><td>{{ $plan->year->year }}</td></tr>
++            <tr><th>الرقم المرجعي</th><td class="num"><b>{{ $plan->ref }}</b></td></tr>
++            <tr><th>السنة</th><td>{{ $plan->year->displayName() }} ({{ $plan->year->year }})</td></tr>
+             <tr><th>المنصب</th><td>{{ $plan->position->name }}</td></tr>
+             <tr><th>مالك الخطة</th><td>{{ $plan->owner->name }}</td></tr>
+             <tr><th>وصف نطاق العمل</th><td>{!! nl2br(e($plan->scope_description ?: '—')) !!}</td></tr>
+@@ -25,6 +26,25 @@
+     </div>
+ </div>
+ 
++@if ($plan->objectives->isNotEmpty())
++    <div class="card">
++        <h2>أهداف الخطة وربطها بالأهداف الاستراتيجية</h2>
++        <div class="table-wrap"><table class="t">
++            <thead><tr><th>الرقم</th><th>هدف الخطة</th><th>الوزن</th><th>الهدف الاستراتيجي للجمعية</th></tr></thead>
++            <tbody>
++            @foreach ($plan->objectives as $o)
++                <tr>
++                    <td class="n">{{ $o->ref }}</td>
++                    <td><a href="{{ route('objectives.show', $o) }}">{{ $o->title }}</a></td>
++                    <td class="n">{{ Fmt::num($o->weight) }}%</td>
++                    <td>@if ($o->strategicGoal)<a href="{{ route('strategic-goals.show', $o->strategicGoal) }}">{{ $o->strategicGoal->label() }}</a>@else<span class="muted small">غير مرتبط</span>@endif</td>
++                </tr>
++            @endforeach
++            </tbody>
++        </table></div>
++    </div>
++@endif
++
+ @if ($results)
+     <div class="card">
+         <div class="card-head">
+@@ -62,9 +82,9 @@
+         <div class="table-wrap"><table class="t">
+             <thead><tr><th>الاسم</th><th>النوع</th><th>المسؤول</th><th>المدة</th><th>المهام</th><th></th></tr></thead>
+             <tbody>
+-            @foreach ($plan->projects as $p)
++            @foreach ($plan->projects->whereNull('parent_id') as $p)
+                 <tr>
+-                    <td><a href="{{ route('projects.show', $p) }}">{{ $p->name }}</a></td>
++                    <td><span class="num small muted">{{ $p->ref }}</span> <a href="{{ route('projects.show', $p) }}">{{ $p->name }}</a>@if ($p->activities->isNotEmpty())<div class="small muted">{{ $p->activities->count() }} نشاط</div>@endif</td>
+                     <td>{{ $p->typeLabel() }}</td>
+                     <td>{{ $p->responsible ?? '—' }}</td>
+                     <td class="n"><span class="num">{{ Fmt::date($p->starts_on) }}</span> – <span class="num">{{ Fmt::date($p->ends_on) }}</span></td>
+diff --git a/resources/views/plans/tabs/tasks.blade.php b/resources/views/plans/tabs/tasks.blade.php
+index 569e518..43352db 100644
+--- a/resources/views/plans/tabs/tasks.blade.php
++++ b/resources/views/plans/tabs/tasks.blade.php
+@@ -8,12 +8,13 @@
+         <div class="empty">لا توجد مهام.</div>
+     @else
+     <div class="table-wrap"><table class="t">
+-        <thead><tr><th>المهمة</th><th>المشروع</th><th>الربع</th><th>المسؤول</th><th>الموعد</th><th>الدليل المطلوب</th><th>الحالة</th><th></th></tr></thead>
++        <thead><tr><th>الرقم</th><th>المهمة</th><th>المبادرة / النشاط</th><th>الربع</th><th>المسؤول</th><th>الموعد</th><th>الدليل المطلوب</th><th>الحالة</th><th></th></tr></thead>
+         <tbody>
+         @foreach ($tasks as $t)
+             <tr>
++                <td class="n">{{ $t->ref }}</td>
+                 <td><b>{{ $t->title }}</b>@if ($t->description)<div class="small muted">{{ $t->description }}</div>@endif</td>
+-                <td class="small">@if ($t->project)<a href="{{ route('projects.show', $t->project) }}">{{ $t->project->name }}</a>@else — @endif</td>
++                <td class="small">@if ($t->project)<a href="{{ route('projects.show', $t->project) }}">{{ $t->project->ref }} {{ $t->project->name }}</a>@if ($t->project->parent)<div class="muted">ضمن {{ $t->project->parent->ref }}</div>@endif @else — @endif</td>
+                 <td>ر{{ $t->quarter }}@if ($t->original_quarter != $t->quarter)<div class="small muted">أصلًا ر{{ $t->original_quarter }}</div>@endif</td>
+                 <td class="small">{{ $t->responsible ?? $t->owner?->name ?? '—' }}</td>
+                 <td class="n">{{ Fmt::date($t->due_on) }}</td>
+diff --git a/resources/views/strategic-goals/index.blade.php b/resources/views/strategic-goals/index.blade.php
+new file mode 100644
+index 0000000..f01a2f2
+--- /dev/null
++++ b/resources/views/strategic-goals/index.blade.php
+@@ -0,0 +1,45 @@
++@extends('layouts.app')
++@section('title', 'الأهداف الاستراتيجية')
++@section('content')
++<div class="ws-title"><h1>الأهداف الاستراتيجية للجمعية</h1><span class="pill">{{ $goals->where('status', 'active')->count() }} هدف فعّال</span></div>
++<p class="small muted">مرجع مشترك لكل المناصب: يُربط كل هدف في الخطة السنوية بهدف استراتيجي. متى وُجد هدف استراتيجي فعّال يغطي سنة الخطة، لا تُرسل الخطة قبل ربط كل أهدافها.</p>
++
++<div class="grid {{ $canManage ? 'g-2-1' : '' }}">
++    <div class="card">
++        @if ($goals->isEmpty())
++            <div class="empty">لا توجد أهداف استراتيجية بعد.@if ($canManage) أضف أول هدف من النموذج.@endif</div>
++        @else
++            <div class="table-wrap"><table class="t">
++                <thead><tr><th>الرقم</th><th>الهدف</th><th>الفترة</th><th>الحالة</th><th>أهداف خطط مرتبطة{{ $canManage ? '' : ' (في خطتك)' }}</th></tr></thead>
++                <tbody>
++                @foreach ($goals as $g)
++                    <tr>
++                        <td class="n"><b>{{ $g->ref }}</b></td>
++                        <td><a href="{{ route('strategic-goals.show', $g) }}"><b>{{ $g->title }}</b></a>@if ($g->description)<div class="small muted">{{ \Illuminate\Support\Str::limit($g->description, 140) }}</div>@endif</td>
++                        <td class="n">{{ $g->from_year ?? '…' }} – {{ $g->to_year ?? '…' }}</td>
++                        <td><span class="badge {{ $g->status === 'active' ? 'ok' : 'closed' }}">{{ $g->statusLabel() }}</span></td>
++                        <td class="n">{{ $counts[$g->id] ?? 0 }}</td>
++                    </tr>
++                @endforeach
++                </tbody>
++            </table></div>
++        @endif
++    </div>
++
++    @if ($canManage)
++    <div class="card">
++        <h2>إضافة هدف استراتيجي</h2>
++        <form method="post" action="{{ route('strategic-goals.store') }}">@csrf
++            <div class="field"><label class="f" for="g-t">عنوان الهدف</label><input id="g-t" type="text" name="title" value="{{ old('title') }}" required></div>
++            <div class="field"><label class="f" for="g-d">الوصف</label><textarea id="g-d" name="description" rows="3">{{ old('description') }}</textarea></div>
++            <div class="form-grid">
++                <div class="field"><label class="f" for="g-f">من سنة (اختياري)</label><input id="g-f" type="number" name="from_year" min="2020" max="2100" value="{{ old('from_year') }}"></div>
++                <div class="field"><label class="f" for="g-to">إلى سنة (اختياري)</label><input id="g-to" type="number" name="to_year" min="2020" max="2100" value="{{ old('to_year') }}"></div>
++            </div>
++            <button class="btn">إضافة</button>
++            <p class="hint">يُمنح الهدف رقمًا مرجعيًا تلقائيًا (SG-01، SG-02…) لا يتغير.</p>
++        </form>
++    </div>
++    @endif
++</div>
++@endsection
+diff --git a/resources/views/strategic-goals/show.blade.php b/resources/views/strategic-goals/show.blade.php
+new file mode 100644
+index 0000000..b8ef1a3
+--- /dev/null
++++ b/resources/views/strategic-goals/show.blade.php
+@@ -0,0 +1,89 @@
++@extends('layouts.app')
++@section('title', $goal->ref . ' — ' . $goal->title)
++@php use App\Support\Fmt; @endphp
++@section('content')
++<div class="ws-title">
++    <h1><span class="num">{{ $goal->ref }}</span> {{ $goal->title }}</h1>
++    <span class="badge {{ $goal->status === 'active' ? 'ok' : 'closed' }}">{{ $goal->statusLabel() }}</span>
++    <a class="btn sec sm right" href="{{ route('strategic-goals.index') }}">← الأهداف الاستراتيجية</a>
++</div>
++
++<div class="grid {{ $canManage ? 'g-2-1' : '' }}">
++    <div>
++        <div class="card">
++            <table class="kv">
++                <tr><th>الوصف</th><td>{!! nl2br(e($goal->description ?: '—')) !!}</td></tr>
++                <tr><th>الفترة</th><td class="num">{{ $goal->from_year ?? '…' }} – {{ $goal->to_year ?? '…' }}</td></tr>
++                <tr><th>أُنشئ</th><td>{{ $goal->creator?->name ?? '—' }} · {{ Fmt::dt($goal->created_at) }}</td></tr>
++            </table>
++        </div>
++        <div class="card">
++            <h2>أهداف الخطط المرتبطة{{ $canManage ? '' : ' (في خطتك)' }}</h2>
++            @if ($objectives->isEmpty())
++                <p class="muted small">لا توجد أهداف خطط مرتبطة بهذا الهدف{{ $canManage ? '' : ' في خطتك' }}.</p>
++            @else
++                <div class="table-wrap"><table class="t">
++                    <thead><tr><th>الرقم</th><th>هدف الخطة</th><th>الخطة</th><th>الوزن</th><th>حالة الخطة</th></tr></thead>
++                    <tbody>
++                    @foreach ($objectives as $o)
++                        <tr>
++                            <td class="n">{{ $o->ref }}</td>
++                            <td><a href="{{ route('objectives.show', $o) }}">{{ $o->title }}</a></td>
++                            <td class="small">{{ $o->plan->position->name }} {{ $o->plan->year->year }}</td>
++                            <td class="n">{{ Fmt::num($o->weight) }}%</td>
++                            <td><span class="badge {{ $o->plan->status }}">{{ $o->plan->statusLabel() }}</span></td>
++                        </tr>
++                    @endforeach
++                    </tbody>
++                </table></div>
++            @endif
++        </div>
++    </div>
++
++    @if ($canManage)
++    <div>
++        <div class="card">
++            <h2>تعديل الهدف</h2>
++            <form method="post" action="{{ route('strategic-goals.update', $goal) }}">@csrf @method('put')
++                <div class="field"><label class="f" for="e-t">العنوان</label><input id="e-t" type="text" name="title" value="{{ old('title', $goal->title) }}" required></div>
++                <div class="field"><label class="f" for="e-d">الوصف</label><textarea id="e-d" name="description" rows="3">{{ old('description', $goal->description) }}</textarea></div>
++                <div class="form-grid">
++                    <div class="field"><label class="f" for="e-f">من سنة</label><input id="e-f" type="number" name="from_year" value="{{ old('from_year', $goal->from_year) }}"></div>
++                    <div class="field"><label class="f" for="e-to">إلى سنة</label><input id="e-to" type="number" name="to_year" value="{{ old('to_year', $goal->to_year) }}"></div>
++                    <div class="field"><label class="f" for="e-s">الترتيب</label><input id="e-s" type="number" name="sort" min="0" value="{{ old('sort', $goal->sort) }}"></div>
++                </div>
++                <button class="btn sec">حفظ</button>
++            </form>
++            <hr>
++            <form method="post" action="{{ route('strategic-goals.status', $goal) }}" class="inline">@csrf
++                @if ($goal->status === 'active')
++                    <input type="hidden" name="status" value="archived"><button class="btn sec sm" data-confirm="أرشفة الهدف؟ تبقى الروابط السابقة ولا يظهر للربط الجديد.">أرشفة</button>
++                @else
++                    <input type="hidden" name="status" value="active"><button class="btn sm">إعادة تفعيل</button>
++                @endif
++            </form>
++            @if ($linkedTotal === 0)
++                <form method="post" action="{{ route('strategic-goals.destroy', $goal) }}" class="inline">@csrf @method('delete')
++                    <button class="btn danger sm" data-confirm="حذف الهدف نهائيًا؟ (غير مرتبط بأي خطة)">حذف</button>
++                </form>
++            @else
++                <p class="hint">مرتبط بـ {{ $linkedTotal }} هدف خطة؛ لا يُحذف ويمكن أرشفته.</p>
++            @endif
++        </div>
++        <div class="card">
++            <h2>سجل التغييرات</h2>
++            <ul class="timeline">
++                @forelse ($history as $h)
++                    <li><code>{{ $h->action }}</code> — {{ $h->user?->name }}
++                        @if ($h->old_values)<div class="small diff-old">{{ json_encode($h->old_values, JSON_UNESCAPED_UNICODE) }}</div>@endif
++                        @if ($h->new_values)<div class="small diff-new">{{ json_encode($h->new_values, JSON_UNESCAPED_UNICODE) }}</div>@endif
++                        <div class="when">{{ Fmt::dt($h->created_at) }}</div></li>
++                @empty
++                    <li class="muted small">لا توجد تغييرات.</li>
++                @endforelse
++            </ul>
++        </div>
++    </div>
++    @endif
++</div>
++@endsection
+diff --git a/routes/web.php b/routes/web.php
+index e3b84b0..203e112 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -15,6 +15,7 @@
+ use App\Http\Controllers\PlanController;
+ use App\Http\Controllers\PlanItemController;
+ use App\Http\Controllers\SearchController;
++use App\Http\Controllers\StrategicGoalController;
+ use App\Http\Controllers\UpdateController;
+ use App\Http\Controllers\WorkflowController;
+ use App\Http\Controllers\YearController;
+@@ -88,6 +89,14 @@
+     Route::post('/plans/{plan}/corrective-actions', [FollowUpController::class, 'storeAction'])->name('corrective.store');
+     Route::post('/corrective-actions/{action}', [FollowUpController::class, 'updateAction'])->name('corrective.update');
+ 
++    // الأهداف الاستراتيجية للجمعية
++    Route::get('/strategic-goals', [StrategicGoalController::class, 'index'])->name('strategic-goals.index');
++    Route::post('/strategic-goals', [StrategicGoalController::class, 'store'])->name('strategic-goals.store');
++    Route::get('/strategic-goals/{goal}', [StrategicGoalController::class, 'show'])->name('strategic-goals.show');
++    Route::put('/strategic-goals/{goal}', [StrategicGoalController::class, 'update'])->name('strategic-goals.update');
++    Route::post('/strategic-goals/{goal}/status', [StrategicGoalController::class, 'status'])->name('strategic-goals.status');
++    Route::delete('/strategic-goals/{goal}', [StrategicGoalController::class, 'destroy'])->name('strategic-goals.destroy');
++
+     // السنوات والأرباع
+     Route::get('/years', [YearController::class, 'index'])->name('years.index');
+     Route::post('/years', [YearController::class, 'store'])->name('years.store');
+diff --git a/tests/Feature/StrategicGoalTest.php b/tests/Feature/StrategicGoalTest.php
+new file mode 100644
+index 0000000..7893fec
+--- /dev/null
++++ b/tests/Feature/StrategicGoalTest.php
+@@ -0,0 +1,149 @@
++<?php
++
++namespace Tests\Feature;
++
++use App\Models\Objective;
++use App\Models\PlanningYear;
++use App\Models\Position;
++use App\Models\StrategicGoal;
++use App\Services\PlanValidator;
++use Tests\TestCase;
++
++/** المرحلة الأولى — الأهداف الاستراتيجية وربط الخطط بها */
++class StrategicGoalTest extends TestCase
++{
++    private function makeGoal(string $who = Position::PLANNING, array $over = []): StrategicGoal
++    {
++        $this->as($who)->post(route('strategic-goals.store'), $over + ['title' => 'تمكين المهندسين مهنيًا', 'description' => 'وصف', 'from_year' => 2026, 'to_year' => 2028])
++            ->assertSessionHasNoErrors();
++
++        return StrategicGoal::latest('id')->first();
++    }
++
++    public function test_president_and_planning_create_goals_with_sequential_refs_and_audit(): void
++    {
++        $a = $this->makeGoal(Position::PLANNING);
++        $b = $this->makeGoal(Position::PRESIDENT, ['title' => 'استدامة الموارد']);
++        $this->assertSame('SG-01', $a->ref);
++        $this->assertSame('SG-02', $b->ref);
++        $this->assertDatabaseHas('audit_logs', ['action' => 'strategic_goal.create', 'entity_id' => $a->id]);
++        $this->assertDatabaseHas('audit_logs', ['action' => 'strategic_goal.create', 'entity_id' => $b->id, 'user_id' => $this->user(Position::PRESIDENT)->id]);
++    }
++
++    public function test_other_roles_cannot_manage_goals(): void
++    {
++        $g = $this->makeGoal();
++        foreach ([Position::ENGINEERING, Position::VICE_PRESIDENT, 'admin'] as $who) {
++            $this->as($who);
++            $this->post(route('strategic-goals.store'), ['title' => 'x'])->assertForbidden();
++            $this->put(route('strategic-goals.update', $g), ['title' => 'x'])->assertForbidden();
++            $this->post(route('strategic-goals.status', $g), ['status' => 'archived'])->assertForbidden();
++            $this->delete(route('strategic-goals.destroy', $g))->assertForbidden();
++        }
++        // أصحاب المناصب يطّلعون، ومدير النظام التقني (بلا منصب) لا
++        $this->as(Position::ENGINEERING)->get(route('strategic-goals.index'))->assertOk()->assertSee('SG-01');
++        $this->get(route('strategic-goals.show', $g))->assertOk();
++        $this->as('admin')->get(route('strategic-goals.index'))->assertForbidden();
++    }
++
++    public function test_restricted_user_sees_only_own_linked_objectives(): void
++    {
++        $g = $this->makeGoal();
++        $eng = $this->plan(Position::ENGINEERING)->objectives()->first();
++        $med = $this->plan(Position::MEDIA)->objectives()->first();
++        Objective::whereIn('id', [$eng->id, $med->id])->update(['strategic_goal_id' => $g->id]);
++
++        $this->as(Position::ENGINEERING)->get(route('strategic-goals.show', $g))->assertOk()->assertSee($eng->title)->assertDontSee($med->title);
++        $this->as(Position::PLANNING)->get(route('strategic-goals.show', $g))->assertSee($eng->title)->assertSee($med->title);
++    }
++
++    public function test_linking_objective_in_draft_plan_and_submission_requires_link(): void
++    {
++        $y = PlanningYear::where('year', 2027)->first();
++        $g = $this->makeGoal();
++        $archived = $this->makeGoal(Position::PLANNING, ['title' => 'قديم']);
++        $this->post(route('strategic-goals.status', $archived), ['status' => 'archived']);
++        $outOfRange = $this->makeGoal(Position::PLANNING, ['title' => 'لاحق', 'from_year' => 2029, 'to_year' => 2030]);
++
++        $this->as(Position::MEDIA)->post(route('plans.store'), ['position_id' => Position::where('code', Position::MEDIA)->value('id'), 'planning_year_id' => $y->id]);
++        $plan = $this->plan(Position::MEDIA, 2027);
++        $this->post(route('objectives.store', $plan), ['title' => 'هدف أ', 'weight' => 100])->assertSessionHasNoErrors();
++        $o = $plan->objectives()->first();
++
++        $msgs = implode("\n", array_column((new PlanValidator())->errors($plan->fresh()), 'message'));
++        $this->assertStringContainsString('اربط الهدف «هدف أ» بهدف استراتيجي', $msgs);
++
++        foreach ([$archived, $outOfRange] as $bad) {
++            $this->put(route('objectives.update', $o), ['title' => 'هدف أ', 'weight' => 100, 'strategic_goal_id' => $bad->id])->assertSessionHasErrors('strategic_goal_id');
++        }
++        $this->put(route('objectives.update', $o), ['title' => 'هدف أ', 'weight' => 100, 'strategic_goal_id' => $g->id])->assertSessionHasNoErrors();
++        $this->assertSame($g->id, $o->fresh()->strategic_goal_id);
++        $msgs = implode("\n", array_column((new PlanValidator())->errors($plan->fresh()), 'message'));
++        $this->assertStringNotContainsString('اربط الهدف', $msgs);
++        $this->get(route('plans.edit', $plan))->assertOk()->assertSee($g->label());
++    }
++
++    public function test_link_is_not_required_when_no_goals_exist(): void
++    {
++        $plan = $this->plan(Position::ENGINEERING);
++        $this->assertSame([], (new PlanValidator())->errors($plan));
++    }
++
++    public function test_linked_goal_cannot_be_deleted_only_archived_and_link_survives(): void
++    {
++        $g = $this->makeGoal();
++        $o = $this->plan(Position::ENGINEERING)->objectives()->first();
++        $o->update(['strategic_goal_id' => $g->id]);
++        $this->delete(route('strategic-goals.destroy', $g))->assertStatus(422);
++        $this->post(route('strategic-goals.status', $g), ['status' => 'archived'])->assertSessionHasNoErrors();
++        $this->assertSame($g->id, $o->fresh()->strategic_goal_id);
++        $this->assertFalse(StrategicGoal::usableFor(2026)->whereKey($g->id)->exists());
++
++        $free = $this->makeGoal(Position::PLANNING, ['title' => 'غير مرتبط']);
++        $this->delete(route('strategic-goals.destroy', $free))->assertRedirect();
++        $this->assertDatabaseHas('audit_logs', ['action' => 'strategic_goal.delete', 'entity_id' => $free->id]);
++        // الرقم المحذوف لا يُعاد استخدامه
++        $this->assertSame('SG-03', $this->makeGoal(Position::PLANNING, ['title' => 'جديد'])->ref);
++    }
++
++    public function test_approved_plan_links_goal_only_through_change_request_with_new_version(): void
++    {
++        $g = $this->makeGoal();
++        $plan = $this->plan(Position::ENGINEERING);
++        $o = $plan->objectives()->first();
++        $this->as(Position::ENGINEERING)->put(route('objectives.update', $o), ['title' => $o->title, 'weight' => $o->weight, 'strategic_goal_id' => $g->id])->assertForbidden();
++
++        $this->post(route('change-requests.store', $plan), ['type' => 'plan_amendment', 'reason' => 'ربط بالخطة الاستراتيجية',
++            'objectives' => [$o->id => ['strategic_goal_id' => $g->id]]])->assertSessionHasNoErrors()->assertRedirect();
++        $cr = $plan->changeRequests()->first();
++        $this->assertSame('غير مرتبط', $cr->changes[0]['old_label']);
++        $this->assertSame($g->label(), $cr->changes[0]['new_label']);
++        $this->as(Position::PRESIDENT)->post(route('change-requests.decide', $cr), ['decision' => 'approve'])->assertSessionHasNoErrors();
++        $this->assertSame($g->id, $o->fresh()->strategic_goal_id);
++        $v2 = $plan->versions()->where('version_no', 2)->first();
++        $this->assertSame($g->label(), $v2->snapshot['objectives'][0]['strategic_goal']);
++        $this->assertNull($plan->versions()->where('version_no', 1)->first()->snapshot['objectives'][0]['strategic_goal'] ?? null);
++        $this->get(route('change-requests.show', $cr))->assertSee($g->label());
++    }
++
++    public function test_copy_structure_keeps_goal_links(): void
++    {
++        $g = $this->makeGoal();
++        $src = $this->plan(Position::ENGINEERING);
++        $src->objectives()->update(['strategic_goal_id' => $g->id]);
++        $this->as(Position::ENGINEERING)->post(route('plans.copy', $src), ['planning_year_id' => PlanningYear::where('year', 2027)->value('id')])->assertRedirect();
++        $new = $this->plan(Position::ENGINEERING, 2027);
++        $this->assertSame([$g->id], $new->objectives()->pluck('strategic_goal_id')->unique()->values()->all());
++    }
++
++    public function test_plan_export_shows_strategic_goal(): void
++    {
++        $g = $this->makeGoal();
++        $plan = $this->plan(Position::ENGINEERING);
++        $plan->objectives()->first()->update(['strategic_goal_id' => $g->id]);
++        $e = app(\App\Services\Export\ExportService::class)->generate($this->user(Position::ENGINEERING), ['scope' => 'plan_full', 'format' => 'docx', 'plan_id' => $plan->id]);
++        $zip = new \ZipArchive();
++        $zip->open(\Illuminate\Support\Facades\Storage::disk('local')->path($e->file_path));
++        $this->assertStringContainsString('SG-01', $zip->getFromName('word/document.xml'));
++    }
++}
+-- 
+2.43.0
+
+
+From 11ed9c2e6022346eea6eb7a86b2ce2ae4bfdbe81 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 29 Sep 2026 13:54:08 +0300
+Subject: [PATCH 4/5] Phase D: initiative/activity/task hierarchy tests, shared
+ I/P ref counter
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Vb8qconasCSK3LJTpKLmPr
+---
+ app/Http/Controllers/PlanItemController.php |   4 +-
+ app/Support/Refs.php                        |  42 +++--
+ tests/Feature/HierarchyRefsTest.php         | 187 ++++++++++++++++++++
+ 3 files changed, 212 insertions(+), 21 deletions(-)
+ create mode 100644 tests/Feature/HierarchyRefsTest.php
+
+diff --git a/app/Http/Controllers/PlanItemController.php b/app/Http/Controllers/PlanItemController.php
+index 97c44b1..2d2a303 100644
+--- a/app/Http/Controllers/PlanItemController.php
++++ b/app/Http/Controllers/PlanItemController.php
+@@ -175,7 +175,7 @@ public function storeTask(Request $r, Plan $plan)
+     {
+         $this->canEdit($plan);
+         $d = $r->validate($this->taskRules(), [], ['title' => 'عنوان المهمة', 'quarter' => 'الربع']);
+-        abort_if($d['project_id'] && ! $plan->projects()->whereKey($d['project_id'])->exists(), 422);
++        abort_if(! empty($d['project_id']) && ! $plan->projects()->whereKey($d['project_id'])->exists(), 422);
+         $t = $plan->tasks()->create($d + ['original_quarter' => $d['quarter'], 'status' => 'planned']);
+         Audit::log('task.create', $t, null, ['ref' => $t->ref] + $d);
+ 
+@@ -186,7 +186,7 @@ public function updateTask(Request $r, Task $task)
+     {
+         $this->canEdit($task->plan);
+         $d = $r->validate($this->taskRules());
+-        abort_if($d['project_id'] && ! $task->plan->projects()->whereKey($d['project_id'])->exists(), 422);
++        abort_if(! empty($d['project_id']) && ! $task->plan->projects()->whereKey($d['project_id'])->exists(), 422);
+         $old = $task->only(array_keys($d));
+         $task->update($d + ['original_quarter' => $d['quarter']]);
+         Audit::log('task.update', $task, $old, ['ref' => $task->ref] + $d);
+diff --git a/app/Support/Refs.php b/app/Support/Refs.php
+index 50b70f3..191dccd 100644
+--- a/app/Support/Refs.php
++++ b/app/Support/Refs.php
+@@ -14,36 +14,40 @@
+  *   الهدف الاستراتيجي  SG-01
+  *   الخطة              PL-2026-ENG
+  *   هدف الخطة          PL-2026-ENG-O1
+- *   المبادرة/المشروع    PL-2026-ENG-I01 / PL-2026-ENG-P01
++ *   المبادرة/المشروع    PL-2026-ENG-I01 / PL-2026-ENG-P02 (عدّاد مشترك)
+  *   النشاط             PL-2026-ENG-I01-A01
+  *   المهمة             PL-2026-ENG-T001
+  */
+ class Refs
+ {
+-    /** الرقم التالي = أكبر من (آخر رقم مسجّل للبادئة) و(أكبر رقم موجود فعلًا) + 1؛ لا يُعاد استخدام رقم محذوف */
+-    private static function next(string $table, string $prefix, int $pad, ?callable $scope = null): string
++    /**
++     * الرقم التالي = أكبر من (آخر رقم مسجّل) و(أكبر رقم موجود فعلًا) + 1؛ لا يُعاد استخدام رقم محذوف.
++     * $letters: بادئات فرعية تتشارك عدّادًا واحدًا (المبادرات I والمشاريع P في الخطة نفسها: I01، P02، I03).
++     */
++    private static function next(string $table, string $base, int $pad, array $letters = [''], ?string $letter = null): string
+     {
+-        // لا نعتمد على تهريب LIKE (يختلف بين SQLite و MySQL): نوسّع البحث ثم نتحقق من البادئة حرفيًا
+-        $q = DB::table($table)->where('ref', 'like', $prefix . '%');
+-        if ($scope) {
+-            $scope($q);
+-        }
++        $letter ??= $letters[0];
+         $max = 0;
+-        foreach ($q->pluck('ref') as $ref) {
+-            if (! str_starts_with($ref, $prefix)) {
+-                continue;
+-            }
+-            $tail = substr($ref, strlen($prefix));
+-            if (ctype_digit($tail)) {
+-                $max = max($max, (int) $tail);
++        foreach ($letters as $l) {
++            $prefix = $base . $l;
++            // لا نعتمد على تهريب LIKE (يختلف بين SQLite و MySQL): نوسّع البحث ثم نتحقق من البادئة حرفيًا
++            foreach (DB::table($table)->where('ref', 'like', $prefix . '%')->pluck('ref') as $ref) {
++                if (! str_starts_with($ref, $prefix)) {
++                    continue;
++                }
++                $tail = substr($ref, strlen($prefix));
++                if (ctype_digit($tail)) {
++                    $max = max($max, (int) $tail);
++                }
+             }
+         }
+ 
+-        $seq = DB::table('ref_sequences')->where('prefix', $prefix)->lockForUpdate()->value('last') ?? 0;
++        $key = $base . implode('|', $letters);
++        $seq = DB::table('ref_sequences')->where('prefix', $key)->lockForUpdate()->value('last') ?? 0;
+         $n = max($max, (int) $seq) + 1;
+-        DB::table('ref_sequences')->updateOrInsert(['prefix' => $prefix], ['last' => $n, 'updated_at' => now(), 'created_at' => now()]);
++        DB::table('ref_sequences')->updateOrInsert(['prefix' => $key], ['last' => $n, 'updated_at' => now()]);
+ 
+-        return $prefix . str_pad((string) $n, $pad, '0', STR_PAD_LEFT);
++        return $base . $letter . str_pad((string) $n, $pad, '0', STR_PAD_LEFT);
+     }
+ 
+     public static function strategicGoal(): string
+@@ -86,7 +90,7 @@ public static function project(Project $p): string
+             return self::next('projects', $parentRef . '-A', 2);
+         }
+ 
+-        return self::next('projects', self::planRef($p->plan_id) . '-' . ($p->type === 'project' ? 'P' : 'I'), 2);
++        return self::next('projects', self::planRef($p->plan_id) . '-', 2, ['I', 'P'], $p->type === 'project' ? 'P' : 'I');
+     }
+ 
+     public static function task(Task $t): string
+diff --git a/tests/Feature/HierarchyRefsTest.php b/tests/Feature/HierarchyRefsTest.php
+new file mode 100644
+index 0000000..761f9cd
+--- /dev/null
++++ b/tests/Feature/HierarchyRefsTest.php
+@@ -0,0 +1,187 @@
++<?php
++
++namespace Tests\Feature;
++
++use App\Models\Plan;
++use App\Models\PlanningYear;
++use App\Models\Position;
++use App\Models\Project;
++use App\Models\Task;
++use Tests\TestCase;
++
++/** المرحلة الأولى — تسلسل المبادرة ← النشاط ← المهمة، والترقيم المرجعي التلقائي */
++class HierarchyRefsTest extends TestCase
++{
++    /** خطة مسودة للشؤون الهندسية في 2027 مع هدف واحد */
++    private function draftPlan(): Plan
++    {
++        $y = PlanningYear::where('year', 2027)->first();
++        $this->as(Position::ENGINEERING)->post(route('plans.store'), ['position_id' => Position::where('code', Position::ENGINEERING)->value('id'), 'planning_year_id' => $y->id]);
++        $plan = $this->plan(Position::ENGINEERING, 2027);
++        $this->post(route('objectives.store', $plan), ['title' => 'رفع الكفاءة', 'weight' => 100])->assertSessionHasNoErrors();
++
++        return $plan->fresh();
++    }
++
++    private function initiative(Plan $plan, array $over = []): Project
++    {
++        $this->post(route('projects.store', $plan), $over + ['type' => 'initiative', 'name' => 'مبادرة التدريب', 'objective_id' => $plan->objectives()->value('id')])->assertSessionHasNoErrors();
++
++        return Project::latest('id')->first();
++    }
++
++    private function activity(Plan $plan, Project $parent, string $name = 'دورة أساسيات'): Project
++    {
++        $this->post(route('projects.store', $plan), ['type' => 'activity', 'parent_id' => $parent->id, 'name' => $name,
++            'owner_user_id' => $this->user(Position::ENGINEERING)->id])->assertSessionHasNoErrors();
++
++        return Project::latest('id')->first();
++    }
++
++    public function test_plan_and_objective_get_refs(): void
++    {
++        $plan = $this->draftPlan();
++        $this->assertSame('PL-2027-ENG', $plan->ref);
++        $this->assertSame('PL-2027-ENG-O1', $plan->objectives()->first()->ref);
++        // الخطط المُرحّلة من البيانات السابقة حصلت على أرقامها أيضًا
++        $this->assertSame('PL-2026-ENG', $this->plan(Position::ENGINEERING)->ref);
++        $this->assertSame(0, Plan::whereNull('ref')->count());
++        $this->assertSame(0, Task::whereNull('ref')->count());
++    }
++
++    public function test_activity_under_initiative_gets_ref_inherits_objective_and_is_audited(): void
++    {
++        $plan = $this->draftPlan();
++        $ini = $this->initiative($plan);
++        $this->assertSame('PL-2027-ENG-I01', $ini->ref);
++
++        $a1 = $this->activity($plan, $ini);
++        $a2 = $this->activity($plan, $ini, 'دورة متقدمة');
++        $this->assertSame('activity', $a1->type);
++        $this->assertSame('PL-2027-ENG-I01-A01', $a1->ref);
++        $this->assertSame('PL-2027-ENG-I01-A02', $a2->ref);
++        $this->assertSame($ini->objective_id, $a1->objective_id);
++        $this->assertDatabaseHas('audit_logs', ['action' => 'activity.create', 'entity_id' => $a1->id]);
++        $this->assertDatabaseHas('audit_logs', ['action' => 'project.create', 'entity_id' => $ini->id]);
++
++        $this->post(route('tasks.store', $plan), ['title' => 'حجز القاعة', 'project_id' => $a1->id, 'quarter' => 1])->assertSessionHasNoErrors();
++        $t = Task::latest('id')->first();
++        $this->assertSame('PL-2027-ENG-T001', $t->ref);
++        $this->assertDatabaseHas('audit_logs', ['action' => 'task.create', 'entity_id' => $t->id]);
++
++        // مشروع مستقل يأخذ البادئة P
++        $p = $this->initiative($plan, ['type' => 'project', 'name' => 'مشروع مستقل']);
++        $this->assertSame('PL-2027-ENG-P02', $p->ref);
++
++        // تغيير هدف المبادرة ينتقل إلى أنشطتها
++        $this->post(route('objectives.store', $plan), ['title' => 'هدف ثانٍ', 'weight' => 0]);
++        $o2 = $plan->objectives()->where('title', 'هدف ثانٍ')->first();
++        $this->put(route('projects.update', $ini), ['type' => 'initiative', 'name' => $ini->name, 'objective_id' => $o2->id])->assertSessionHasNoErrors();
++        $this->assertSame($o2->id, $a1->fresh()->objective_id);
++        $this->assertDatabaseHas('audit_logs', ['action' => 'project.update', 'entity_id' => $ini->id]);
++    }
++
++    public function test_hierarchy_rules(): void
++    {
++        $plan = $this->draftPlan();
++        $ini = $this->initiative($plan);
++        $a = $this->activity($plan, $ini);
++
++        // لا نشاط تحت نشاط
++        $this->post(route('projects.store', $plan), ['type' => 'activity', 'parent_id' => $a->id, 'name' => 'x'])->assertSessionHasErrors('parent_id');
++        // النشاط يتطلب مبادرة أم
++        $this->post(route('projects.store', $plan), ['type' => 'activity', 'name' => 'x'])->assertSessionHasErrors('parent_id');
++        // لا نشاط تحت مبادرة من خطة أخرى
++        $foreign = $this->plan(Position::ENGINEERING)->projects()->whereNull('parent_id')->first();
++        $this->post(route('projects.store', $plan), ['type' => 'activity', 'parent_id' => $foreign->id, 'name' => 'x'])->assertSessionHasErrors('parent_id');
++        // لا حذف لمبادرة لها أنشطة
++        $this->delete(route('projects.destroy', $ini))->assertSessionHasErrors('project');
++        $this->assertNotNull($ini->fresh());
++        $this->assertSame(1, Project::where('parent_id', $ini->id)->count());
++    }
++
++    public function test_refs_are_never_reused_after_deletion(): void
++    {
++        $plan = $this->draftPlan();
++        $ini = $this->initiative($plan);
++        $a = $this->activity($plan, $ini);
++        $this->delete(route('projects.destroy', $a))->assertSessionHasNoErrors();
++        $this->assertDatabaseHas('audit_logs', ['action' => 'activity.delete', 'entity_id' => $a->id]);
++        $this->assertSame('PL-2027-ENG-I01-A02', $this->activity($plan, $ini, 'بديل')->ref);
++
++        $this->post(route('tasks.store', $plan), ['title' => 'م1', 'quarter' => 1]);
++        $t1 = Task::latest('id')->first();
++        $this->delete(route('tasks.destroy', $t1));
++        $this->post(route('tasks.store', $plan), ['title' => 'م2', 'quarter' => 2]);
++        $this->assertSame('PL-2027-ENG-T002', Task::latest('id')->first()->ref);
++
++        $this->delete(route('projects.destroy', Project::where('parent_id', $ini->id)->first()));
++        $this->delete(route('projects.destroy', $ini))->assertSessionHasNoErrors();
++        $this->assertSame('PL-2027-ENG-I02', $this->initiative($plan)->ref);
++    }
++
++    public function test_pages_show_refs_and_search_finds_by_ref(): void
++    {
++        $plan = $this->draftPlan();
++        $ini = $this->initiative($plan);
++        $a = $this->activity($plan, $ini);
++        $this->post(route('tasks.store', $plan), ['title' => 'حجز القاعة', 'project_id' => $a->id, 'quarter' => 1]);
++
++        $this->get(route('projects.show', $ini))->assertOk()->assertSee('PL-2027-ENG-I01')->assertSee('PL-2027-ENG-I01-A01');
++        $this->get(route('projects.show', $a))->assertOk()->assertSee('PL-2027-ENG-T001')->assertSee('مبادرة التدريب');
++        $this->get(route('plans.show', [$plan, 'tab' => 'tasks']))->assertOk()->assertSee('PL-2027-ENG-T001')->assertSee('ضمن PL-2027-ENG-I01');
++        $this->get(route('plans.edit', $plan))->assertOk()->assertSee('PL-2027-ENG-I01-A01');
++        $this->get(route('plans.index'))->assertOk();
++
++        $this->get(route('search', ['q' => 'I01-A01']))->assertOk()->assertSee('دورة أساسيات');
++        $this->get(route('search', ['q' => 'PL-2027-ENG-T001']))->assertOk()->assertSee('حجز القاعة');
++    }
++
++    public function test_restricted_user_cannot_reach_other_plans_hierarchy(): void
++    {
++        $plan = $this->draftPlan();
++        $ini = $this->initiative($plan);
++        $a = $this->activity($plan, $ini);
++
++        $this->as(Position::MEDIA);
++        $this->get(route('projects.show', $a))->assertForbidden();
++        $this->post(route('projects.store', $plan), ['type' => 'activity', 'parent_id' => $ini->id, 'name' => 'x'])->assertForbidden();
++        $this->delete(route('projects.destroy', $a))->assertForbidden();
++        $this->get(route('search', ['q' => 'PL-2027-ENG']))->assertOk()->assertDontSee('دورة أساسيات');
++    }
++
++    public function test_copy_structure_keeps_activities_with_new_refs(): void
++    {
++        $src = $this->plan(Position::ENGINEERING);
++        $ini = $src->projects()->whereNull('parent_id')->orderBy('id')->first();
++        $act = $src->projects()->create(['type' => 'activity', 'parent_id' => $ini->id, 'name' => 'نشاط منقول', 'objective_id' => $ini->objective_id]);
++        $src->tasks()->create(['title' => 'مهمة النشاط', 'project_id' => $act->id, 'quarter' => 1, 'original_quarter' => 1, 'status' => 'planned']);
++        $this->assertStringStartsWith($ini->ref . '-A', $act->ref);
++
++        $this->as(Position::ENGINEERING)->post(route('plans.copy', $src), ['planning_year_id' => PlanningYear::where('year', 2027)->value('id')])->assertRedirect();
++        $new = $this->plan(Position::ENGINEERING, 2027);
++        $newAct = $new->projects()->where('name', 'نشاط منقول')->first();
++        $this->assertNotNull($newAct);
++        $this->assertSame('activity', $newAct->type);
++        $this->assertStringStartsWith('PL-2027-ENG-', $newAct->ref);
++        $this->assertSame($new->id, $newAct->parent->plan_id);
++        $this->assertSame($ini->name, $newAct->parent->name);
++        $this->assertSame($newAct->id, $new->tasks()->where('title', 'مهمة النشاط')->value('project_id'));
++        // لا تكرار في الأرقام المرجعية
++        $this->assertSame(Project::count(), Project::distinct()->count('ref'));
++        $this->assertSame(Task::count(), Task::distinct()->count('ref'));
++    }
++
++    public function test_export_contains_refs(): void
++    {
++        $plan = $this->draftPlan();
++        $ini = $this->initiative($plan);
++        $this->activity($plan, $ini);
++        $e = app(\App\Services\Export\ExportService::class)->generate($this->user(Position::ENGINEERING), ['scope' => 'plan_full', 'format' => 'docx', 'plan_id' => $plan->id]);
++        $zip = new \ZipArchive();
++        $zip->open(\Illuminate\Support\Facades\Storage::disk('local')->path($e->file_path));
++        $xml = $zip->getFromName('word/document.xml');
++        $this->assertStringContainsString('PL-2027-ENG-O1', $xml);
++        $this->assertStringContainsString('PL-2027-ENG-I01-A01', $xml);
++    }
++}
+-- 
+2.43.0
+
+
+From 0e82a7ec5eca1959ab18d358dce0e2b18e2cff47 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 29 Sep 2026 13:56:40 +0300
+Subject: [PATCH 5/5] Wrap objective summary badges on narrow screens
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Vb8qconasCSK3LJTpKLmPr
+---
+ public/css/app.css | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/public/css/app.css b/public/css/app.css
+index a25d697..7c905f2 100644
+--- a/public/css/app.css
++++ b/public/css/app.css
+@@ -186,7 +186,7 @@ .steps span.done { background: var(--ok-bg); color: var(--ok); }
+ .steps span.cur { background: var(--brand); color: #fff; font-weight: 700; }
+ .steps i { color: var(--gray-2); font-style: normal; }
+ details.box { border: 1px solid var(--line); border-radius: 10px; background: #fff; margin-bottom: .6rem; }
+-details.box > summary { cursor: pointer; padding: .6rem .8rem; font-weight: 700; list-style: none; display: flex; align-items: center; gap: .5rem; }
++details.box > summary { cursor: pointer; padding: .6rem .8rem; font-weight: 700; list-style: none; display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+ details.box > summary::-webkit-details-marker { display: none; }
+ details.box > summary::before { content: '◂'; color: var(--muted); transition: transform .15s; }
+ details.box[open] > summary::before { transform: rotate(-90deg); }
+-- 
+2.43.0
+
